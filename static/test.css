@@ -1,8 +1,8 @@
 body {
-  background-image:url('\static\assets\background.png');
-  background-repeat: no-repeat;
-  background-attachment: fixed;
-  background-size: cover;
+    background-image:url('/static/assets/background.png');
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    background-size: cover;
 }
 
 .navbar-header{
@@ -16,5 +16,5 @@ body {
 }
 
 .icon-bar{
-    
+
 }
