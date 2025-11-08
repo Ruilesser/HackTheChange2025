@@ -9,7 +9,7 @@
 }
 
 body {
-  background-image:url('assets/contact.png');
+  background-image:url('assets/about.png');
   background-repeat: no-repeat;
   background-attachment: fixed;
   background-size: cover;
@@ -26,9 +26,23 @@ body {
   left: 0; */
 }
 
-.desc {
+.content{
+  display: flex;
+  flex-direction: column;
+}
+
+.inner-content{
+  display: flex;
+  flex-direction: column;
+}
+
+ul {
   text-align: center;
-  margin-top: 1%;
-  padding-top: 40px;
+  /* margin-top: 1%;
+  padding-top: 40px; */
   font-family: RadleyRegular;
+}
+
+li {
+  list-style-type: none
 }
