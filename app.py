@@ -1,6 +1,6 @@
 from flask import Flask, redirect, url_for, request, render_template, jsonify
 from markupsafe import escape
-import requests\
+import requests
 
 
 app = Flask(__name__) 
