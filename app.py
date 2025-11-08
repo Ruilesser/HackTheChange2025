@@ -13,6 +13,15 @@ def test():
     #return 'This is the about page and what we do'
     return render_template('test.html')
 
+@app.route('/contact')
+def test():
+    #return 'This is the about page and what we do'
+    return render_template('contact.html')
+
+@app.route('/')
+def home():
+     return render_template('')
+
 if __name__ == '__main__':
         print("Working")
         app.run(debug=True)
