@@ -1,0 +1,26 @@
+@font-face {
+  font-family: "RadleyItalic"; 
+  src: url("../static/assets/Radley-Italic.ttf") format("truetype");
+}
+
+body {
+  background-image:url('assets/about.png');
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  background-size: cover;
+}
+
+.navbar{
+  /* width: 200px; */
+  background-color: #f4f1e8;/* semi-transparent */
+  padding: 20px;
+  font-family: RadleyItalic;
+  /* position: fixed;
+  height: 100%;
+  top: 0;
+  left: 0; */
+}
+
+.icon-bar{
+    
+}

@@ -10,10 +10,9 @@ body {
   background-color: #f4f1e8;/* semi-transparent */
   padding: 20px;
   position: fixed;
-  height: 100%;
+  /* height: 100%;
   top: 0;
-  left: 0;
-
+  left: 0; */
 }
 
 button{

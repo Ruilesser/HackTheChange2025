@@ -14,14 +14,19 @@ def test():
     return render_template('test.html')
 
 @app.route('/contact')
-def test():
+def contact():
     #return 'This is the about page and what we do'
     return render_template('contact.html')
 
+@app.route('/map')
+def map():
+    #return 'This is the about page and what we do'
+    return render_template('map.html')
+
 @app.route('/')
 def home():
-     return render_template('')
+     return render_template('home.html')
 
 if __name__ == '__main__':
-        print("Working")
-        app.run(debug=True)
+    print("Working")
+    app.run(debug=True)
