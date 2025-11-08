@@ -82,12 +82,15 @@ function latLonToVector3(lat, lon, radius = RADIUS) {
 // containers for OSM features
 const featurePoints = new THREE.Group();
 const featureLines = new THREE.Group();
+const countryBorders = new THREE.Group();
 scene.add(featurePoints);
 scene.add(featureLines);
+scene.add(countryBorders);
 
 function clearFeatures() {
   featurePoints.clear();
   featureLines.clear();
+  countryBorders.clear();
 }
 
 function renderPoint(lat, lon, color = 0xff3333, size = 0.02) {
@@ -119,6 +122,47 @@ function renderLine(coords, color = 0x00ff00, width = 1) {
   featureLines.add(line);
 }
 
+function renderCountryLine(coords, color = 0xffffff, width = 1) {
+  const radius = (modelScaledRadius || RADIUS) + 0.006;
+  const sampled = simplifyCoords(coords, 800);
+  const points = sampled.map(([lon, lat]) => latLonToVector3(lat, lon, radius));
+  const positions = new Float32Array(points.length * 3);
+  points.forEach((p, i) => {
+    positions[i * 3 + 0] = p.x;
+    positions[i * 3 + 1] = p.y;
+    positions[i * 3 + 2] = p.z;
+  });
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const mat = new THREE.LineBasicMaterial({ color, linewidth: width });
+  const line = new THREE.Line(geom, mat);
+  countryBorders.add(line);
+}
+
+async function fetchCountries(simplify = 0.2) {
+  try {
+    const qs = new URLSearchParams({ simplify: String(simplify) });
+    const res = await fetch(`/api/countries?${qs.toString()}`);
+    if (!res.ok) {
+      console.warn('Failed to load countries', await res.text());
+      return;
+    }
+    const geo = await res.json();
+    if (!geo || !geo.features) return;
+    for (const f of geo.features) {
+      const g = f.geometry;
+      if (!g) continue;
+      if (g.type === 'LineString') {
+        renderCountryLine(g.coordinates, 0xffffff, 1);
+      } else if (g.type === 'MultiLineString') {
+        for (const part of g.coordinates) renderCountryLine(part, 0xffffff, 1);
+      }
+    }
+  } catch (e) {
+    console.error('Error fetching countries', e);
+  }
+}
+
 function renderPolygon(rings, color = 0x00aa00) {
   // rings is array of linear rings; render outer ring as a line loop
   if (!rings || rings.length === 0) return;
@@ -139,17 +183,77 @@ function simplifyCoords(coords, maxPoints) {
 async function fetchOverpass(lat, lon, radiusMeters) {
   const status = document.getElementById('status');
   status.textContent = 'Loading...';
+  // use streaming endpoint for larger radii to avoid large single responses
+  const useStream = radiusMeters > 3000;
   try {
-    const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
-    const res = await fetch(`/api/overpass?${qs.toString()}`);
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error('Overpass API request failed: ' + txt);
+    if (useStream) {
+      await fetchOverpassStream(lat, lon, radiusMeters);
+    } else {
+      const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
+      const res = await fetch(`/api/overpass?${qs.toString()}`);
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error('Overpass API request failed: ' + txt);
+      }
+      const geojson = await res.json();
+      clearFeatures();
+      for (const feat of geojson.features || []) {
+        const geom = feat.geometry;
+        if (!geom) continue;
+        if (geom.type === 'Point') {
+          const [lon, lat] = geom.coordinates;
+          renderPoint(lat, lon, 0xff5533, 0.02);
+        } else if (geom.type === 'LineString') {
+          renderLine(geom.coordinates, 0x00ff88);
+        } else if (geom.type === 'Polygon') {
+          renderPolygon(geom.coordinates, 0x009988);
+        }
+      }
     }
-    const geojson = await res.json();
-    clearFeatures();
-    for (const feat of geojson.features || []) {
-      const geom = feat.geometry;
+  } catch (err) {
+    console.error('Failed to fetch/parse Overpass data', err);
+    alert('Failed to load Overpass data: ' + err.message);
+  } finally {
+    status.textContent = '';
+  }
+}
+
+async function fetchOverpassStream(lat, lon, radiusMeters) {
+  clearFeatures();
+  const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
+  const res = await fetch(`/api/overpass_stream?${qs.toString()}`);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error('Overpass stream failed: ' + txt);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch (e) {
+        console.warn('Failed to parse NDJSON line', e, line);
+        continue;
+      }
+      if (obj._error) {
+        console.warn('Overpass tile error', obj);
+        continue;
+      }
+      if (obj._meta) {
+        // progress or done marker
+        continue;
+      }
+      // treat as GeoJSON Feature
+      const geom = obj.geometry;
       if (!geom) continue;
       if (geom.type === 'Point') {
         const [lon, lat] = geom.coordinates;
@@ -160,11 +264,25 @@ async function fetchOverpass(lat, lon, radiusMeters) {
         renderPolygon(geom.coordinates, 0x009988);
       }
     }
-  } catch (err) {
-    console.error('Failed to fetch/parse Overpass data', err);
-    alert('Failed to load Overpass data: ' + err.message);
-  } finally {
-    status.textContent = '';
+  }
+  // parse final buffer
+  if (buf.trim()) {
+    try {
+      const obj = JSON.parse(buf.trim());
+      if (obj && obj.geometry) {
+        const geom = obj.geometry;
+        if (geom.type === 'Point') {
+          const [lon, lat] = geom.coordinates;
+          renderPoint(lat, lon, 0xff5533, 0.02);
+        } else if (geom.type === 'LineString') {
+          renderLine(geom.coordinates, 0x00ff88);
+        } else if (geom.type === 'Polygon') {
+          renderPolygon(geom.coordinates, 0x009988);
+        }
+      }
+    } catch (e) {
+      console.warn('final NDJSON parse failed', e, buf);
+    }
   }
 }
 
@@ -279,3 +397,6 @@ function animate() {
 }
 
 animate();
+
+// fetch and render country borders once (simplified)
+fetchCountries(0.2);
