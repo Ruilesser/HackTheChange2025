@@ -1,14 +1,10 @@
-from flask import Flask, redirect, url_for, request, render_template
-from markupsafe import escape
-import mysql.connector
-
-app = Flask(__name__) 
-
-@app.route('/about')
-def about():
-        #return 'This is the about page and what we do'
-        return render_template('about.html')
-
-if __name__ == '__main__':
-        print("Working")
-        app.run(debug=True)
+import os
+import json
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, flash, jsonify, session, Response
+import multiprocessing as mp
+import uuid
+import os
+import time
+import threading
+import tempfile
+import queue as pyqueue
