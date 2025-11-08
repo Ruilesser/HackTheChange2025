@@ -1,10 +1,47 @@
-body {
-    background-image:url('/static/assets/background.png');
-    background-repeat: no-repeat;
-    background-attachment: fixed;
-    background-size: cover;
+
+@font-face {
+  font-family: "RadleyItalic"; 
+  src: url("../static/assets/Radley-Italic.ttf") format("truetype");
 }
 
-nav {
-    color: #f4f1e8;
+body {
+  background-image:url('assets/background.png');
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  background-size: cover;
+}
+
+.navbar{
+  /* width: 200px; */
+  background-color: #f4f1e8;/* semi-transparent */
+  padding: 20px;
+  font-family: RadleyItalic;
+  /* position: fixed;
+  height: 100%;
+  top: 0;
+  left: 0; */
+  color: #9b4819;
+}
+
+nav a{
+    color: #9b4819;
+}
+
+.p {
+  text-align: center;
+  margin-top: 1%;
+  padding-top: 40px;
+  font-family: RadleyRegular;
+
+}
+
+.title {
+  text-align: center; 
+  padding-top: 40px;
+  font-family: RadleyRegular;
+}
+
+.active {
+  background-color: #f4f1e8;
+  color: #9b4819;
 }

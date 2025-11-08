@@ -24,11 +24,27 @@ body {
   height: 100%;
   top: 0;
   left: 0; */
+  color: #9b4819;
 }
 
-.desc {
+nav a{
+    color: #9b4819;
+}
+.p {
   text-align: center;
   margin-top: 1%;
   padding-top: 40px;
   font-family: RadleyRegular;
+
+}
+
+.title {
+  text-align: center; 
+  padding-top: 40px;
+  font-family: RadleyRegular;
+}
+
+.active {
+  background-color: #f4f1e8;
+  color: #9b4819;
 }
