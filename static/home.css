@@ -1,0 +1,10 @@
+body {
+    background-image:url('/static/assets/background.png');
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    background-size: cover;
+}
+
+nav {
+    color: #f4f1e8;
+}
