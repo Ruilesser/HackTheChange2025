@@ -458,18 +458,35 @@ def get_country_boundaries(simplify_tol=0.1):
     local_file = os.path.join(app.static_folder or 'static', 'assets', 'countries.geojson')
     gj = load_countries_geojson(local_file)
     if gj is None:
-        # attempt to download a public countries GeoJSON and save locally
-        url = 'https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson'
-        try:
-            r = requests.get(url, timeout=20)
-            r.raise_for_status()
-            gj = r.json()
-            os.makedirs(os.path.dirname(local_file), exist_ok=True)
-            with open(local_file, 'w', encoding='utf-8') as fh:
-                json.dump(gj, fh)
-        except Exception as e:
-            app.logger.warning('Failed to download countries geojson: %s', e)
-            return None
+        # attempt to download from a few known public sources (fall back if one fails)
+        candidate_urls = [
+            'https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson',
+            'https://raw.githubusercontent.com/datasets/geo-boundaries-world-110m/master/countries.geojson',
+            'https://raw.githubusercontent.com/datasets/geo-boundaries-simplified/master/countries.geojson'
+        ]
+        gj = None
+        for url in candidate_urls:
+            try:
+                app.logger.info('Attempting to download countries geojson from %s', url)
+                r = requests.get(url, timeout=20)
+                r.raise_for_status()
+                gj = r.json()
+                # persist a local copy for future runs
+                try:
+                    os.makedirs(os.path.dirname(local_file), exist_ok=True)
+                    with open(local_file, 'w', encoding='utf-8') as fh:
+                        json.dump(gj, fh)
+                    app.logger.info('Saved countries geojson to %s', local_file)
+                except Exception as e:
+                    app.logger.warning('Failed to save countries geojson locally: %s', e)
+                break
+            except Exception as e:
+                app.logger.warning('Failed to download countries geojson from %s: %s', url, e)
+
+        if gj is None:
+            app.logger.error('All attempts to obtain countries geojson failed; returning empty feature collection')
+            # return an empty FeatureCollection instead of None so client receives a 200 and can continue
+            return {'type': 'FeatureCollection', 'features': []}
 
     # Try to use Shapely for assembling/simplifying boundaries; if not available,
     # fall back to extracting polygon exteriors directly from the GeoJSON.
