@@ -23,6 +23,10 @@ body {
 
 .p {
   text-align: center;
+<<<<<<< HEAD
   margin-top: 1%;
   padding-top: 40px;
+=======
+  font-family: RadleyRegular;
+>>>>>>> d128ca84859f2500849d4ccd52831cf99c9a6fcd
 }
