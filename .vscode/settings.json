@@ -1,0 +1,8 @@
+{
+  "terminal.integrated.defaultProfile.windows": "Git Bash",
+  "python.defaultInterpreterPath": "./.venv/Scripts/python.exe",
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.venv": true
+  }
+}
