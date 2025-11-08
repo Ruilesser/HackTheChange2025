@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-        <title>Bootstrap Example</title>
+        <title>ABOUT</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/css/bootstrap.min.css">
@@ -10,9 +10,33 @@
 </head>
 <body>
 
-<div class="container-fluid">
-        <h1>My First Bootstrap Page</h1>
-        <p>This is some text.</p>
+<nav class="navbar navbar-inverse navbar-fixed-top">
+  <div class="container-fluid">
+    <!-- Navbar header -->
+    <div class="navbar-header">
+      <button type="button" class="navbar-toggle" data-toggle="collapse" data-target="#myNavbar">
+        <!-- Navbar button triple line -->
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>                        
+      </button>
+      <a class="navbar-brand" href="#">MySite</a>
+    </div>
+
+    <!-- Navbar links -->
+    <div class="collapse navbar-collapse" id="myNavbar">
+      <ul class="nav navbar-nav">
+        <li><a href="/map">Map</a></li>
+        <li class="active"><a href="/about">About</a></li>
+      </ul>
+    </div>
+  </div>
+</nav>
+
+<!-- Main Page Content -->
+<div class="container-fluid" style="margin-top: 70px;">
+    <h1><b>ABOUT</b></h1>
+    <p>An interactive map with the purposes of economic and social development for several population sizes and socioeconomic areas. (environmental, if we have the time)</p>
 </div>
 
 </body>
