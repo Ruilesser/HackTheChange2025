@@ -170,9 +170,94 @@ async function fetchOverpass(lat, lon, radiusMeters) {
 
 // UI: load example OSM reconstruction data (London 5 km)
 document.getElementById('load-osm').addEventListener('click', () => {
-  // center near London by default
-  fetchOverpass(51.5074, -0.1278, 5000);
+  // center near London by default and fetch
+  const lat = 51.5074, lon = -0.1278;
+  centerOnLatLon(lat, lon, 3.5);
+  fetchOverpass(lat, lon, 5000);
 });
+
+// Geolocation: center on user's current position
+document.getElementById('locate-me').addEventListener('click', () => {
+  const status = document.getElementById('status');
+  if (!navigator.geolocation) {
+    alert('Geolocation not supported by your browser');
+    return;
+  }
+  status.textContent = 'Requesting location...';
+  navigator.geolocation.getCurrentPosition((pos) => {
+    const lat = pos.coords.latitude;
+    const lon = pos.coords.longitude;
+    centerOnLatLon(lat, lon, 3.0);
+    // initial fetch uses radius based on current camera distance
+    const dist = camera.position.distanceTo(controls.target || new THREE.Vector3());
+    const radius = cameraDistanceToRadius(dist);
+    fetchOverpass(lat, lon, radius);
+    status.textContent = '';
+  }, (err) => {
+    status.textContent = '';
+    alert('Failed to get location: ' + (err && err.message));
+  }, { enableHighAccuracy: true, maximumAge: 60000, timeout: 10000 });
+});
+
+// helpers: convert 3D vector to lat/lon
+function vector3ToLatLon(v) {
+  const r = v.length() || 1;
+  const lat = 90 - Math.acos(v.y / r) * (180 / Math.PI);
+  const lon = Math.atan2(v.z, -v.x) * (180 / Math.PI) - 180;
+  return { lat, lon };
+}
+
+// map camera distance to Overpass search radius (meters)
+function cameraDistanceToRadius(distance) {
+  // distance roughly scales with model radius (modelScaledRadius==1)
+  // map distance in [1.5, 10] -> radius in meters [200, 20000]
+  const minD = 1.5, maxD = 10;
+  const minR = 200, maxR = 20000;
+  const t = Math.min(1, Math.max(0, (distance - minD) / (maxD - minD)));
+  // invert so smaller distance => smaller radius
+  const v = 1 - t;
+  return Math.round(minR + v * (maxR - minR));
+}
+
+// center camera and controls target on lat/lon; factor controls camera distance multiplier
+function centerOnLatLon(lat, lon, distanceFactor = 3.5) {
+  const target = latLonToVector3(lat, lon, modelScaledRadius || RADIUS);
+  controls.target.copy(target);
+  // set camera position along same direction but farther out
+  const camPos = target.clone().multiplyScalar(distanceFactor);
+  camera.position.copy(camPos);
+  controls.update();
+}
+
+// debounce/fetch-on-end logic
+let lastFetch = { lat: null, lon: null, radius: null };
+let fetchScheduled = null;
+
+function shouldFetch(newLat, newLon, newRadius) {
+  if (lastFetch.lat === null) return true;
+  const dLat = Math.abs(lastFetch.lat - newLat);
+  const dLon = Math.abs(lastFetch.lon - newLon);
+  // rough degrees -> meters approx (lat ~111km per deg)
+  const metersMoved = Math.sqrt((dLat * 111320) ** 2 + (dLon * 111320) ** 2);
+  const radiusChanged = Math.abs(newRadius - (lastFetch.radius || 0)) / (lastFetch.radius || 1);
+  return metersMoved > 500 || radiusChanged > 0.3;
+}
+
+function scheduleFetchForControls() {
+  if (fetchScheduled) clearTimeout(fetchScheduled);
+  fetchScheduled = setTimeout(() => {
+    const target = controls.target.clone();
+    const { lat, lon } = vector3ToLatLon(target);
+    const dist = camera.position.distanceTo(target);
+    const radius = cameraDistanceToRadius(dist);
+    if (shouldFetch(lat, lon, radius)) {
+      lastFetch = { lat, lon, radius };
+      fetchOverpass(lat, lon, radius);
+    }
+  }, 600);
+}
+
+controls.addEventListener('end', scheduleFetchForControls);
 
 // resize handling
 function onWindowResize() {
