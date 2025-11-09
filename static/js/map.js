@@ -753,3 +753,321 @@ animate();
 // fetch and render country borders via streaming (covers full globe initially)
 // bbox format: minlat,minlon,maxlat,maxlon
 fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 0.2 });
+
+// -----------------------------------------------------------
+// Utilities
+// -----------------------------------------------------------
+function lonLatToMeters(lon, lat) {
+    const RADIUS = 6378137.0; // Earth's radius in meters (WGS84)
+    const x = lon * RADIUS * Math.PI / 180.0;
+    const y = Math.log(Math.tan((90 + lat) * Math.PI / 360.0)) * RADIUS;
+    return { x: x, y: y };
+}
+
+async function getElevation(lat, lon) {
+    //Get elevation (m) for given coordinates using OpenTopoData SRTM90m
+    const url = `https://api.opentopodata.org/v1/srtm90m?locations=${lat},${lon}`;
+    const response = await fetch(url);
+    const data = await response.json();
+    if ('results' in data && data.results.length > 0) {
+        return data.results[0].elevation ?? 0.0;
+    }
+    return 0.0;
+}
+
+// -----------------------------------------------------------
+// Height parsing ------------------------------------------------
+// Building heights
+function parseHeight(tags) {
+    /** Parse building height and min_height if available. */
+    function safeFloat(value) {
+        try {
+            return parseFloat(value.toLowerCase().replace("m", "").trim());
+        } catch (e) {
+            return null;
+        }
+    }
+
+    let height = safeFloat(tags.height ?? "");
+    let minHeight = safeFloat(tags.min_height ?? tags["building:min_height"] ?? "");
+    let levels = safeFloat(tags["building:levels"] ?? "");
+    let minLevels = safeFloat(tags["building:min_level"] ?? "");
+
+    // height if missing
+    if (height === null && levels !== null) {
+        height = levels * 3.0;
+    }
+    if (minHeight === null && minLevels !== null) {
+        minHeight = minLevels * 3.0;
+    }
+
+    // Fallbacks - check for heights
+    if (height === null) {
+        height = tags.building ? 10.0 : 0.0;
+    }
+    if (minHeight === null) {
+        minHeight = 0.0;
+    }
+
+    return {
+        height: height,
+        min_height: minHeight,
+        effective_height: Math.max(0.0, height - minHeight) // USE THIS FOR HEIGHT ON MAP
+    };
+}
+
+// -----------------------------------------------------------
+// OSM extraction
+// -----------------------------------------------------------
+function extractElements(osmJson) {
+    /**
+     * Extract all 'way' elements from full JSON
+     * node coordinates into lat/lon points.
+     * Returns a list of objects like:
+     *   { points: [...], tags: {...}, type: 'way' }
+     * You can filter by tag (e.g. 'building', 'highway')
+     */
+    const elements = osmJson.elements || [];
+    const nodes = {};
+    elements.forEach(n => {
+        if (n.type === "node") nodes[n.id] = n;
+    });
+
+    const extracted = [];
+    elements.forEach(el => {
+        if (el.type === "way") {
+            const points = (el.nodes || []).map(nid => {
+                if (nodes[nid]) {
+                    return { lat: nodes[nid].lat, lon: nodes[nid].lon };
+                }
+            }).filter(p => p !== undefined);
+
+            if (points.length > 0) {
+                extracted.push({
+                    points: points,
+                    tags: el.tags || {},
+                    id: el.id,
+                    type: el.type
+                });
+            }
+        }
+    });
+    return extracted;
+}
+
+function isBuilding(element) {
+    //True if element is a building (has 'building' tag)
+    return "building" in (element.tags || {});
+}
+
+// -----------------------------------------------------------
+// Processing functions
+// -----------------------------------------------------------
+function getIconForElement(element, iconMap) {
+    /**
+     * Assign an icon based on tags:
+     * - Recreational amenities get generic recreational icon
+     * - Other amenities use value-specific icons if available, otherwise default
+     * - Natural uses one generic icon
+     * - Emergency uses value-specific icons
+     * - Other keys use default per key or global fallback
+     */
+    const tags = element.tags || {};
+
+    for (const [key, value] of Object.entries(tags)) {
+        // --- Amenity ---
+        if (key === "amenity") {
+            const recreationList = [
+                "bar", "bbq", "brothel", "cafe", "cinema", "food_court",
+                "marketplace", "nightclub", "restaurant", "swinger_club",
+                "theatre", "vending_machine"
+            ];
+            if (recreationList.includes(value)) {
+                return iconMap.amenity[value] || iconMap.amenity._default;
+            }
+            // Non-recreation amenities: use value-specific icon if exists, else default
+            return iconMap.amenity[value] || iconMap.amenity._default;
+        }
+
+        // --- Emergency ---
+        if (key === "emergency") {
+            return iconMap.emergency[value] || iconMap.emergency._default;
+        }
+
+        // --- Natural ---
+        if (key === "natural") {
+            return iconMap.natural._default;
+        }
+
+        // --- Other keys ---
+        if (key in iconMap) {
+            return iconMap[key]._default || iconMap._global_default._default;
+        }
+    }
+
+    // --- Global fallback ---
+    return iconMap._global_default._default;
+}
+
+async function processElement(element, iconMap) {
+    /** Compute center, elevation, and height (if any). */
+    const lat = element.points.reduce((sum, p) => sum + p.lat, 0) / element.points.length;
+    const lon = element.points.reduce((sum, p) => sum + p.lon, 0) / element.points.length;
+    const baseElev = await getElevation(lat, lon);
+
+    const heightInfo = isBuilding(element) ? parseHeight(element.tags) : {
+        height: 0.0,
+        min_height: 0.0,
+        effective_height: 0.0 // USE THIS
+    };
+
+    const icon = getIconForElement(element, iconMap);
+    const xy = lonLatToMeters(lon, lat);
+
+    return {
+        id: element.id,
+        points: element.points,
+        centroid: { lat, lon },
+        xy: xy, // this is the coordinates to use on the map
+        base_elev: baseElev,
+        ...heightInfo,
+        tags: element.tags,
+        icon: icon
+    };
+}
+
+// -----------------------------------------------------------
+// Main entry point
+// -----------------------------------------------------------
+async function processOsmJson(jsonString) {
+    /**
+     * Process a full OSM JSON string.
+     * Returns a unified list of all elements, each with:
+     *   - id, points, center, xy, base_elev
+     *   - height/min_height/effective_height (if any)
+     *   - tags
+     */
+    const osmData = JSON.parse(jsonString);
+    const allElements = extractElements(osmData);
+    const processed = [];
+    for (const el of allElements) {
+        processed.push(await processElement(el, ICON_MAP));
+    }
+    return processed;
+}
+
+// -----------------------------------------------------------
+// ICON_MAP
+// -----------------------------------------------------------
+const ICON_MAP = {
+    // ------------------- AMENITY -------------------
+    amenity: {
+        // --- Recreational amenities (generic icon) ---
+        bar: "icons/amenity_recreational.svg",
+        bbq: "icons/amenity_recreational.svg",
+        brothel: "icons/amenity_recreational.svg",
+        cafe: "icons/amenity_recreational.svg",
+        cinema: "icons/amenity_recreational.svg",
+        food_court: "icons/amenity_recreational.svg",
+        marketplace: "icons/amenity_recreational.svg",
+        nightclub: "icons/amenity_recreational.svg",
+        restaurant: "icons/amenity_recreational.svg",
+        swinger_club: "icons/amenity_recreational.svg",
+        theatre: "icons/amenity_recreational.svg",
+        vending_machine: "icons/amenity_recreational.svg",
+
+        // --- Other amenities with value-specific icons ---
+        bicycle_parking: "icons/amenity_vehicle.svg",
+        bicycle_rental: "icons/amenity_vehicle.svg",
+        car_rental: "icons/amenity_vehicle.svg",
+        car_sharing: "icons/amenity_vehicle.svg",
+        fuel: "icons/amenity_vehicle.svg",
+        parking: "icons/amenity_vehicle.svg",
+
+        charging_station: "icons/amenity_charging_station.svg",
+
+        clinic: "icons/health.svg",
+        dentist: "icons/health.svg",
+        doctors: "icons/health.svg",
+        hospital: "icons/health.svg",
+        pharmacy: "icons/health.svg",
+
+        college: "icons/amenity_education.svg",
+        kindergarten: "icons/amenity_education.svg",
+        school: "icons/amenity_education.svg",
+
+        courthouse: "icons/amenity_public_building.svg",
+        fire_station: "icons/emergency_fire_station.svg",
+        police: "icons/emergency_police.svg",
+
+        ferry_terminal: "icons/amenity_ferry_terminal.svg",
+        grave_yard: "icons/amenity_grave_yard.svg",
+        library: "icons/amenity_library.svg",
+        place_of_worship: "icons/amenity_place_of_worship.svg",
+
+        post_box: "icons/amenity_post.svg",
+        post_office: "icons/amenity_post.svg",
+
+        prison: "icons/amenity_prison.svg",
+        public_building: "icons/amenity_public_building.svg",
+        recycling: "icons/amenity_recycling.svg",
+        shelter: "icons/amenity_shelter.svg",
+
+        taxi: "icons/amenity_taxi.svg",
+
+        telephone: "icons/amenity_telephone.svg",
+        toilets: "icons/amenity_toilets.svg",
+        townhall: "icons/amenity_public_building.svg",
+
+        drinking_water: "icons/water.svg",
+        water_point: "icons/water.svg",
+
+        // --- Fallback for any other amenity ---
+        _default: "icons/amenity.svg"
+    },
+
+    // ------------------- NATURAL (single icon) -------------------
+    natural: { _default: "icons/natural.svg" },
+
+    // ------------------- EMERGENCY -------------------
+    emergency: {
+        ambulance_station: "icons/emergency_ambulance_station.svg",
+        fire_station: "icons/emergency_fire_station.svg",
+        lifeguard_station: "icons/emergency_lifeguard_station.svg",
+        police: "icons/emergency_police.svg",
+        first_aid: "icons/emergency_first_aid.svg",
+        defibrillator: "icons/emergency_first_aid.svg",
+        assembly_point: "icons/emergency_assembly_point.svg",
+        _default: "icons/emergency.svg"
+    },
+
+    // ------------------- OTHER KEYS (generic default per key) -------------------
+    aerialway: { _default: "icons/aerialway.svg" },
+    aeroway: { _default: "icons/aerialway.svg" },
+    barrier: { _default: "icons/barrier.svg" },
+    boundary: { _default: "icons/barrier.svg" },
+    building: { _default: "icons/building.svg" },
+    craft: { _default: "icons/craft.svg" },
+    geological: { _default: "icons/geological.svg" },
+    healthcare: { _default: "icons/health.svg" },
+    highway: { _default: "icons/highway.svg" },
+    historic: { _default: "icons/historic.svg" },
+    landuse: { _default: "icons/landuse.svg" },
+    leisure: { _default: "icons/leisure.svg" },
+    man_made: { _default: "icons/man_made.svg" },
+    military: { _default: "icons/military.svg" },
+    office: { _default: "icons/office.svg" },
+    place: { _default: "icons/place.svg" },
+    power: { _default: "icons/power.svg" },
+    public_transport: { _default: "icons/public_transport.svg" },
+    railway: { _default: "icons/route.svg" },
+    route: { _default: "icons/route.svg" },
+    shop: { _default: "icons/shop.svg" },
+    telecom: { _default: "icons/telecom.svg" },
+    tourism: { _default: "icons/tourism.svg" },
+    water: { _default: "icons/water.svg" },
+    waterway: { _default: "icons/water.svg" },
+
+    // ------------------- GLOBAL FALLBACK -------------------
+    _global_default: { _default: "icons/default.svg" }
+};
