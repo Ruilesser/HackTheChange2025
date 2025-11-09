@@ -60,10 +60,24 @@ scene.add(countryBorders);
 // Sprite-based labels (Three.js) for performance and consistent scaling
 const spriteLabels = []; // array of { sprite, worldPos: Vector3, priority }
 
+// Clear only OSM feature layers (keep country borders and labels intact)
 function clearFeatures() {
   featurePoints.clear();
   featureLines.clear();
+}
+
+// Clear everything including country borders and label sprites
+function clearAllFeatures() {
+  featurePoints.clear();
+  featureLines.clear();
   countryBorders.clear();
+  // remove sprite labels from scene
+  for (const s of spriteLabels) {
+    try { scene.remove(s); } catch (e) { /* ignore */ }
+    if (s.material && s.material.map) s.material.map.dispose();
+    if (s.material) s.material.dispose();
+  }
+  spriteLabels.length = 0;
 }
 
 function renderPoint(lat, lon, color = 0xff3333, size = 0.02) {
@@ -138,7 +152,8 @@ async function fetchCountries(simplify = 0.2) {
 
 // New: stream country outlines (NDJSON) and render incrementally.
 async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null, simplify=0.1 } = {}) {
-  clearFeatures();
+  // when fetching countries we want to clear existing country outlines and labels
+  clearAllFeatures();
   // build query string
   const params = new URLSearchParams();
   params.set('simplify', String(simplify));
