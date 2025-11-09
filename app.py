@@ -9,6 +9,64 @@ import os
 app = Flask(__name__)
 
 
+# Helpers for spherical math and geometry rep extraction
+def _latlon_to_unit_vec(lat, lon):
+    """Convert geographic lat,lon to a unit 3D vector (x,y,z) on a unit sphere.
+
+    Uses the same convention as client latLonToVector3 (right-handed mapping).
+    """
+    phi = math.radians(90.0 - float(lat))
+    theta = math.radians(float(lon) + 180.0)
+    x = -(math.sin(phi) * math.cos(theta))
+    z = math.sin(phi) * math.sin(theta)
+    y = math.cos(phi)
+    return (x, y, z)
+
+
+def _rep_latlon_from_geom(geom):
+    """Return a representative (lat, lon) tuple for a GeoJSON geometry.
+
+    For Point -> direct coords, LineString -> midpoint, Polygon/MultiLine -> center of longest part.
+    Returns (lat, lon) or (None, None) if not available.
+    """
+    if not geom:
+        return (None, None)
+    gtype = geom.get('type')
+    coords = geom.get('coordinates')
+    try:
+        if gtype == 'Point':
+            lon, lat = coords[0], coords[1]
+            return (lat, lon)
+        if gtype == 'LineString':
+            if not coords:
+                return (None, None)
+            mid = coords[len(coords) // 2]
+            lon, lat = mid[0], mid[1]
+            return (lat, lon)
+        if gtype == 'Polygon':
+            exterior = coords[0] if coords else None
+            if exterior:
+                mid = exterior[len(exterior) // 2]
+                lon, lat = mid[0], mid[1]
+                return (lat, lon)
+        if gtype == 'MultiLineString' or gtype == 'MultiPolygon':
+            best = None
+            best_len = -1
+            for part in coords:
+                if not part:
+                    continue
+                if len(part) > best_len:
+                    best_len = len(part)
+                    best = part
+            if best:
+                mid = best[len(best) // 2]
+                lon, lat = mid[0], mid[1]
+                return (lat, lon)
+    except Exception:
+        return (None, None)
+    return (None, None)
+
+
 @app.route('/')
 def home():
     return render_template('home.html')
@@ -73,6 +131,13 @@ def api_overpass():
     start_time = time.time()
 
     bbox_str = f"{minlat},{minlon},{maxlat},{maxlon}"
+    
+    # optional observer for server-side hemisphere/backface culling
+    observer_lat = request.args.get('observer_lat', type=float)
+    observer_lon = request.args.get('observer_lon', type=float)
+    observer_vec = None
+    if observer_lat is not None and observer_lon is not None:
+        observer_vec = _latlon_to_unit_vec(observer_lat, observer_lon)
 
     overpass_q = f"""
 [out:json][timeout:25];
@@ -229,8 +294,26 @@ out geom;
         features.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [float(lonn), float(latn)]}, "properties": {}})
 
     geojson = {"type": "FeatureCollection", "features": features}
+
+    # server-side hemisphere/backface culling: if an observer is provided,
+    # exclude features whose representative point lies on the far side of the globe
+    if observer_vec is not None:
+        filtered = []
+        for feat in features:
+            geom = feat.get('geometry')
+            lat_rep, lon_rep = _rep_latlon_from_geom(geom)
+            if lat_rep is None or lon_rep is None:
+                # keep features we cannot classify
+                filtered.append(feat)
+                continue
+            v = _latlon_to_unit_vec(lat_rep, lon_rep)
+            dot = v[0] * observer_vec[0] + v[1] * observer_vec[1] + v[2] * observer_vec[2]
+            if dot > 0:
+                filtered.append(feat)
+        geojson['features'] = filtered
+
     elapsed = time.time() - start_time
-    app.logger.debug(f"Overpass query time: {elapsed:.2f}s, features: {len(features)}")
+    app.logger.debug(f"Overpass query time: {elapsed:.2f}s, features: {len(geojson.get('features', []))}")
     return jsonify(geojson)
 
 
@@ -268,6 +351,12 @@ def api_overpass_stream():
     # tiling parameters
     lat_span = maxlat - minlat
     lon_span = maxlon - minlon
+    # optional observer for hemisphere/backface culling
+    observer_lat = request.args.get('observer_lat', type=float)
+    observer_lon = request.args.get('observer_lon', type=float)
+    observer_vec = None
+    if observer_lat is not None and observer_lon is not None:
+        observer_vec = _latlon_to_unit_vec(observer_lat, observer_lon)
     tile_deg = 0.02
     nx = min(8, max(1, int(math.ceil(lon_span / tile_deg))))
     ny = min(8, max(1, int(math.ceil(lat_span / tile_deg))))
@@ -420,6 +509,16 @@ out geom;
                     continue
                 feats = assemble_features_from_elements(elems_t)
                 for f in feats:
+                    # server-side hemisphere/backface culling per-feature (optional)
+                    if observer_vec is not None:
+                        geom = f.get('geometry')
+                        lat_rep, lon_rep = _rep_latlon_from_geom(geom)
+                        if lat_rep is not None and lon_rep is not None:
+                            v = _latlon_to_unit_vec(lat_rep, lon_rep)
+                            dot = v[0] * observer_vec[0] + v[1] * observer_vec[1] + v[2] * observer_vec[2]
+                            if dot <= 0:
+                                # behind the globe relative to the observer, skip
+                                continue
                     yield json.dumps(f) + "\n"
         yield json.dumps({"_meta": {"status": "done"}}) + "\n"
 
@@ -635,6 +734,13 @@ def api_countries_stream():
     if shapely_ok:
         target_box = box(minlon, minlat, maxlon, maxlat)
 
+    # optional server-side observer for hemisphere/backface culling
+    observer_lat = request.args.get('observer_lat', type=float)
+    observer_lon = request.args.get('observer_lon', type=float)
+    observer_vec = None
+    if observer_lat is not None and observer_lon is not None:
+        observer_vec = _latlon_to_unit_vec(observer_lat, observer_lon)
+
     def gen():
         count = 0
         for feat in countries.get('features', []):
@@ -667,6 +773,17 @@ def api_countries_stream():
                         out_props['centroid'] = [c_lon, c_lat]
                     out_props['label_priority'] = priority
                     out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': out_props }
+                    # server-side backface culling: if observer provided and centroid exists, skip far-side features
+                    if observer_vec is not None and 'centroid' in out_props:
+                        try:
+                            c_lon, c_lat = float(out_props['centroid'][0]), float(out_props['centroid'][1])
+                            v = _latlon_to_unit_vec(c_lat, c_lon)
+                            dot = v[0] * observer_vec[0] + v[1] * observer_vec[1] + v[2] * observer_vec[2]
+                            if dot <= 0:
+                                # not visible from observer hemisphere
+                                continue
+                        except Exception:
+                            pass
                     yield json.dumps(out) + "\n"
                     count += 1
                 else:
@@ -714,6 +831,16 @@ def api_countries_stream():
                     # priority fallback: number of points
                     out_props['label_priority'] = float(len(all_pts) if 'all_pts' in locals() else 0)
                     out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': out_props }
+                    # fallback path: perform same centroid-based backface cull if possible
+                    if observer_vec is not None and out_props.get('centroid'):
+                        try:
+                            c_lon, c_lat = float(out_props['centroid'][0]), float(out_props['centroid'][1])
+                            v = _latlon_to_unit_vec(c_lat, c_lon)
+                            dot = v[0] * observer_vec[0] + v[1] * observer_vec[1] + v[2] * observer_vec[2]
+                            if dot <= 0:
+                                continue
+                        except Exception:
+                            pass
                     yield json.dumps(out) + "\n"
                     count += 1
             except Exception as e:
