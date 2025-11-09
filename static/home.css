@@ -1,0 +1,310 @@
+@font-face {
+  font-family: "RadleyItalic"; 
+  src: url("../static/assets/Radley-Italic.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "RadleyRegular"; 
+  src: url("../static/assets/Radley-Regular.ttf") format("truetype");
+}
+
+body {
+  background-image: url('assets/blueback.png') !important;
+  background-repeat: no-repeat !important;
+  background-attachment: fixed !important;
+  background-size: cover !important;
+  margin: 0;
+  padding-top: 60px;
+}
+
+/* Fixed Navbar */
+.navbar {
+  background-color: transparent !important;
+  padding: 10px 20px;
+  font-family: RadleyItalic;
+  border: none !important;
+  box-shadow: none !important;
+  position: fixed;
+  width: 100%;
+  z-index: 10;
+  top: 0;
+}
+
+.navbar-inverse {
+  background-color: transparent !important;
+  border: none !important;
+}
+
+nav a {
+  color: #16416f;
+}
+
+/* Navbar brand (site title) */
+.navbar-inverse .navbar-brand,
+.navbar-brand {
+  color: #16416f !important;
+  font-weight: normal;
+  background-color: transparent !important;
+  padding-top: 10px;
+}
+
+/* Navbar links (default state) */
+.navbar-inverse .navbar-nav > li > a {
+  color: #16416f !important;
+  background-color: transparent !important;
+  font-weight: normal;
+  padding-top: 10px;
+}
+
+/* Hover and active states — bold, same color, no background */
+.navbar-inverse .navbar-nav > li > a:hover,
+.navbar-inverse .navbar-nav > li > a:focus,
+.navbar-inverse .navbar-nav > li.active > a,
+.active {
+  color: #16416f !important;
+  background-color: transparent !important;
+  font-weight: bold;
+}
+
+/* Hamburger icon for mobile */
+.navbar-inverse .navbar-toggle,
+.navbar-toggle {
+  background-color: transparent !important;
+  border-color: #16416f !important;
+  padding-top: 10px;
+}
+
+.navbar-inverse .navbar-toggle .icon-bar,
+.icon-bar {
+  background-color: #16416f !important;
+}
+
+/* Keep the mobile menu transparent */
+.navbar-collapse,
+.navbar-collapse.collapse,
+.navbar-collapse.collapse.in {
+  background-color: transparent !important;
+  border: none !important;
+  padding-top: 10px;
+}
+
+.navbar-logo {
+  height: 50px;
+  width: auto;
+  display: inline-block;
+  vertical-align: middle;
+  margin-top: 0px; /* Move logo up slightly */
+  
+}
+
+/* Text styles */
+.p {
+  text-align: center;
+  margin-top: 1%;
+  padding-top: 40px;
+  font-family: RadleyRegular;
+}
+
+.title {
+  text-align: left; 
+  margin-left: 200px;
+  padding-top: 100px;
+  font-family: RadleyRegular;
+  font-size: 100px;
+  color: #191919;
+  opacity: 0;
+  animation: fadeIn 2.0s ease forwards;
+}
+
+.desc {
+  text-align: center; 
+  padding-top: 40px;
+  font-family: RadleyRegular;
+  color: #191919;
+}
+
+.italic {
+  font-family: RadleyItalic;
+  padding-top: 20px;
+  font-size: 100px;
+  color: #16416f;
+}
+
+/* Hero section */
+.hero {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #e9ecef;
+  position: relative;
+  overflow: hidden;
+
+  scroll-margin-top: 80px; /* same height as your navbar */
+
+}
+
+.teaser {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+}
+
+.earth-preview {
+  position: absolute;
+  inset: 0;
+  background: url('placeholder-earth.jpg') center/cover no-repeat;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+}
+
+.teaser:hover .earth-preview {
+  opacity: 1;
+}
+
+.overlay {
+  position: relative;
+  z-index: 2;
+  text-align: center;
+  color: #191919;
+  font-family: RadleyRegular;
+}
+
+.explore-btn {
+  margin-top: 1.5rem;
+  background: #16416f;
+  border-color: #16416f;
+  border-width: 3px;
+  padding: 0.8rem 1.6rem;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 1.7rem;
+  transition: background 0.3s;
+}
+
+.explore-btn:hover {
+  background: #e9ecef;
+  color: #16416f;
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideFromLeft {
+  from {
+    transform: translateX(-100%) scale(1);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0) scale(1);
+    opacity: 1;
+  }
+}
+
+/* Iframe container */
+.iframe-container {
+  width: 80%;
+  height: 400px;
+  margin: 40px auto;
+  border: 1px solid #16416f;
+  overflow: hidden;
+  border-radius: 40px;
+}
+
+.iframe-container iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.text {
+    font-size: 1.7rem;
+    font-family: RadleyRegular;
+    max-width: 1000px;
+    line-height: 1.6;
+    margin: 0 auto;
+    text-align: left;
+    margin-left: 300px;
+    padding-top: 10px;
+}
+
+.scroll-down {
+  display: block;
+  font-size: 1.8rem;          /* slightly smaller for balance */
+  background: #16416f;
+  border: none;
+  cursor: pointer;
+  animation: bounce 2s infinite;
+  font-family: "RadleyItalic", serif;
+  color: #e9ecef;
+  border-radius: 30px;
+  padding: 10px 28px;          /* less vertical padding, more horizontal padding */
+  margin-top: 65px;           /* move the button lower */
+  margin-left: 365px;         /* your existing horizontal placement */
+  transition: transform 0.2s ease, background 0.3s ease;
+}
+/* simple bounce animation for the arrow */
+@keyframes bounce {
+  0%, 20%, 50%, 80%, 100% { transform: translateY(0); }
+  40% { transform: translateY(-10px); }
+  60% { transform: translateY(-5px); }
+}
+
+.image-fade {
+  position: relative;
+  display: inline-block;
+}
+
+.image-fade img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.image-fade::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 80px; /* how tall the fade should be */
+  background: linear-gradient(to bottom, rgba(244,241,232,0) 0%, #e9ecef 100%);
+}
+
+
+body {
+  position: relative; /* make the pseudo-element layer work */
+  z-index: 0; /* ensure it's a valid stacking context */
+  background-image: url('assets/blueback.png');
+  background-repeat: no-repeat;
+
+  background-size: cover;
+  background-color: #e9ecef;
+}
+/* 
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0 0 0 0;
+  pointer-events: none;
+  z-index: 1; /* put it ABOVE the background but BELOW all content 
+  background: linear-gradient(to bottom, rgba(244,241,232,0) 60%, #e9ecef 100%);
+} */
+
+.break {
+    padding-bottom: 400px;
+}
+
+.text2 {
+    font-size: 1.7rem;
+    font-family: RadleyRegular;
+    max-width: 1000px;
+    line-height: 1.6;
+    margin: 0 auto;
+    text-align: center;
+}
+

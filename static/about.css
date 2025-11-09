@@ -1,0 +1,132 @@
+@font-face {
+  font-family: "RadleyItalic"; 
+  src: url("../static/assets/Radley-Italic.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "RadleyRegular"; 
+  src: url("../static/assets/Radley-Regular.ttf") format("truetype");
+}
+
+body {
+  background-color: #f4f1e8;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  background-size: cover;
+}
+
+.navbar {
+  /* width: 200px; */
+  background-color: #f4f1e8;/* semi-transparent */
+  padding: 20px;
+  font-family: RadleyItalic;
+  /* position: fixed;
+  height: 100%;
+  top: 0;
+  left: 0; */
+  border: none !important;
+  padding-top: 10px;
+}
+
+.p {
+  text-align: center;
+  margin-top: 1%;
+  padding-top: 40px;
+  font-family: RadleyRegular;
+
+}
+
+.title{
+  text-align: center; 
+  padding-top: 50pxpx;
+  font-family: RadleyRegular;
+  font-size: 100px;
+  color: #191919;
+  opacity: 0;
+  animation: fadeIn 2.0s ease forwards;
+}
+
+.desc {
+  text-align: center; 
+  padding-top: 40px;
+  font-family: RadleyRegular;
+  color: #191919;
+}
+
+.active {
+  background-color: #f4f1e8;
+  color: #9b4819;
+}
+.navbar-brand, .navbar-toggle, .icon-bar{
+  color: #9b4819;
+  padding-top: 10px;
+}
+.navbar .navbar-inverse .navbar-fixed-top .navbar-expand-lg{
+  color: #9b4819;
+  background-color: transparent;
+  box-shadow: none !important;
+  border: none !important;
+  position: fixed;
+  width: 100%;
+  z-index: 10;
+  font-family: RadleyItalic;
+  padding-top: 10px;
+}
+
+/* Navbar brand (site title) */
+.navbar-inverse .navbar-brand {
+  color: #9b4819 !important;
+  font-weight: normal;
+}
+
+/* Navbar links (default state) */
+.navbar-inverse .navbar-nav > li > a {
+  color: #9b4819 !important;
+  background-color: transparent !important;
+  font-weight: normal;
+}
+
+/* Hover and active states — bold, same color, no background */
+.navbar-inverse .navbar-nav > li > a:hover,
+.navbar-inverse .navbar-nav > li > a:focus,
+.navbar-inverse .navbar-nav > li.active > a {
+  color: #9b4819 !important;
+  background-color: transparent !important;
+  font-weight: bold;
+}
+
+/* Hamburger icon for mobile */
+.navbar-inverse .navbar-toggle .icon-bar {
+  background-color: #9b4819 !important;
+  padding-top: 10px;
+}
+
+/* Keep the mobile menu transparent */
+.navbar-collapse,
+.navbar-collapse.collapse.in {
+  background-color: transparent !important;
+  padding-top: 10px;
+}
+
+.navbar-logo {
+  height: 50px; /* adjust to fit your navbar */
+  width: auto;  /* maintains aspect ratio */
+  display: inline-block;
+  vertical-align: middle; /* centers logo in navbar */
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideFromLeft {
+  from {
+    transform: translateX(-100%) scale(1);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0) scale(1);
+    opacity: 1;
+  }
+}
