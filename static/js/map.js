@@ -1387,11 +1387,11 @@ try {
   fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 1.5 });
 }
 
-///* TEST ICONS WORK, uncomment this if you want to see test values
+/* TEST ICONS WORK, uncomment this if you want to see test values
 setTimeout(() => {
-    testIconPlacement();
+    testIconPlacementAtKnownLocations();
 }, 2000); 
-//*/
+*/
 
 // -----------------------------------------------------------
 // Utilities
