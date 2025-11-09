@@ -196,7 +196,6 @@ class AIService:
 # ----- Simple test harness -----
 async def main_demo():
     adapters = {
-        "ollama": OllamaAdapter(endpoint="http://localhost:11434", concurrency=2),
         "gemini": GeminiAdapter(api_key="dummy", concurrency=2),
         "local": LocalProcessAdapter(cmd="./local_model", concurrency=1),
     }
