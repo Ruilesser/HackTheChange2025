@@ -1,6 +1,90 @@
 // map.js - module that builds a Three.js globe and supports markers
 import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
 import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+//import { GoogleGenerativeAI } from "@google/generative-ai";
+
+async function callGeminiAPI(prompt) {
+    const API_KEY = "AIzaSyBQ7eKuefURDF7CA7mhT4Oe_ntu2ruLiMk";
+    
+    // Updated endpoint for newer Gemini models
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${API_KEY}`;
+    
+    
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                contents: [{
+                    parts: [{
+                        text: prompt
+                    }]
+                }],
+                generationConfig: {
+                    temperature: 0.7,
+                    topK: 40,
+                    topP: 0.95,
+                    maxOutputTokens: 2048,
+                }
+            })
+        });
+        
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('API Response error:', errorText);
+            throw new Error(`HTTP error! status: ${response.status} - ${errorText}`);
+        }
+        
+        const data = await response.json();
+        
+        // Check if the response structure is as expected
+        if (!data.candidates || !data.candidates[0] || !data.candidates[0].content || !data.candidates[0].content.parts || !data.candidates[0].content.parts[0]) {
+            console.error('Unexpected API response structure:', data);
+            throw new Error('Unexpected API response structure');
+        }
+        
+        return data.candidates[0].content.parts[0].text;
+    } catch (error) {
+        console.error('Gemini API call failed:', error);
+        throw error;
+    }
+}
+
+
+// Remove the duplicate AIService class definition (the second one around line 400)
+// Keep only this one:
+class AIService {
+  constructor() {
+    this.apiKey = "AIzaSyBQ7eKuefURDF7CA7mhT4Oe_ntu2ruLiMk";
+  }
+
+  async submit(data, timeout = 30000) { // Increased timeout for longer responses
+    try {
+      const prompt = `You are an advanced urban planning, sustainability, and community-development analysis model. You produce formal, narrative, human-readable reports, written for community leaders, municipal planners, and urban development authorities. You must never output JSON, code, bullet-free raw data dumps, or any machine-formatted structure. Your output must always be a coherent, multi-section written report in professional planning language. You will analyze this JSON consisting of restaurants, hospitals, and other amenities and services, and in turn you will give recommendations for improving urban planning, sustainability, and community development based on the data provided. Your report must be at least 500 words long and cover multiple aspects of urban planning and community development. Here is the data: ${JSON.stringify(data)}`;
+
+      return await callGeminiAPI(prompt);
+    } catch (error) {
+      console.error("Error calling Gemini API:", error);
+      throw error;
+    }
+  }
+}
+
+// Then use it like this in the locate-me handler:
+setTimeout(() => {
+  const allData = passAllDataTo(async (data) => {
+    const aiService = new AIService();
+    try {
+      const result = await aiService.submit(data);
+      console.log('AI Analysis completed:', result);
+      // Display or process the result
+    } catch (error) {
+      console.error('AI Analysis failed:', error);
+    }
+  });
+}, 2000);
 
 const container = document.getElementById('map-container');
 
@@ -1363,58 +1447,81 @@ async function fetchOverpass(lat, lon, radiusMeters) {
 
 // Geolocation: center on user's current position
 // Modify the locate-me handler to ensure icons load
-document.getElementById('locate-me').addEventListener('click', () => {
+document.getElementById('locate-me').addEventListener('click', async () => {
   setStatus('Requesting device location…', 'loading', 10000);
+  
   if (!navigator.geolocation) {
     setStatus('Geolocation not supported by your browser', 'error', 5000);
-    alert('Geolocation not supported by your browser');
     return;
   }
   
-  // Clear previous data and cache
-  clearAllFeatures();
-  clearOverpassCache();
-  clearIconMarkers();
-  
-  // Reset icon throttle for new location
-  lastIconRequestTime = 0;
-  lastIconLocationKey = null;
-  
-  // Cancel any ongoing requests
-  if (currentOverpassController) {
-    currentOverpassController.abort();
-    currentOverpassController = null;
-  }
-  
-  navigator.geolocation.getCurrentPosition((pos) => {
-    const lat = pos.coords.latitude;
-    const lon = pos.coords.longitude;
-    
-    clearIconMarkers();
-    flyToLatLon(lat, lon, 3.0, 900, () => {
-      try { 
-        // Force icon loading by passing immediate option
-        requestVisibleData(lat, lon, { 
-          immediate: true, 
-          customRadius: 1000,
-          forceIcons: true  // Add this flag
-
-          
-        });
-        // Send all data to your target function after loading
-        setTimeout(() => {
-          const allData = passAllDataTo(yourTargetFunction);
-          console.log('Location data sent to target function:', allData);
-        }, 2000); // Wait for data to load
-        
-      } catch (e) { console.warn('locate-me: requestVisibleData failed', e); }
+  try {
+    const position = await new Promise((resolve, reject) => {
+      navigator.geolocation.getCurrentPosition(resolve, reject, {
+        enableHighAccuracy: true,
+        maximumAge: 60000,
+        timeout: 10000
+      });
     });
-    clearStatus();
-  }, (err) => {
-    clearStatus();
+    
+    const lat = position.coords.latitude;
+    const lon = position.coords.longitude;
+    
+    // Clear previous data
+    clearAllFeatures();
+    clearOverpassCache();
+    clearIconMarkers();
+    lastIconRequestTime = 0;
+    lastIconLocationKey = null;
+    
+    if (currentOverpassController) {
+      currentOverpassController.abort();
+      currentOverpassController = null;
+    }
+    
+    // Fly to location and load data
+    await new Promise((resolve) => {
+      flyToLatLon(lat, lon, 3.0, 900, resolve);
+    });
+    
+    // Load OSM data first
+    await requestVisibleData(lat, lon, { 
+      immediate: true, 
+      customRadius: 1000,
+      forceIcons: true
+    });
+    
+    // Wait a bit for data to load, then send to AI
+    setTimeout(async () => {
+      try {
+        setStatus('Analyzing location data with AI...', 'loading', 10000);
+        
+        const allData = passAllDataTo(null); // Get data without immediate callback
+        
+        if (!allData || (!allData.osmData && !allData.countryData)) {
+          setStatus('No data available for AI analysis', 'error', 5000);
+          return;
+        }
+        
+        const aiService = new AIService();
+        const result = await aiService.submit(allData);
+        
+        console.log('AI Analysis Result:', result);
+        setStatus('AI analysis completed!', 'info', 5000);
+        
+        // You can display the result in your UI here
+        // For example: displayAnalysisResult(result);
+        
+      } catch (error) {
+        console.error('AI Analysis failed:', error);
+        setStatus('AI analysis failed - check console for details', 'error', 5000);
+      }
+    }, 3000);
+    
+  } catch (error) {
+    console.error('Geolocation failed:', error);
     setStatus('Failed to get device location', 'error', 6000);
-    alert('Failed to get location: ' + (err && err.message));
-  }, { enableHighAccuracy: true, maximumAge: 60000, timeout: 10000 });
+  }
 });
 
 // helpers: convert 3D vector to lat/lon
