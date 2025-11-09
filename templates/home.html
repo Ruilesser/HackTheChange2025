@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Welcome to PlanetPulse</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/css/bootstrap.min.css">
+  <link rel="stylesheet" href="/static/home.css">
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+  <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/js/bootstrap.min.js"></script>
+</head>
+<body>
+
+<nav class="navbar navbar-inverse navbar-fixed-top navbar-expand-lg">
+  <div class="container-fluid">
+    <!-- Navbar header -->
+    <div class="navbar-header">
+      <button type="button" class="navbar-toggle" data-toggle="collapse" data-target="#myNavbar">
+        <!-- Navbar button triple line -->
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>                        
+      </button>
+      <a class="navbar-brand" href="/">
+        <img src="../static/assets/logob.png" alt="logo" class="navbar-logo">
+      </a>
+    </div>
+
+    <!-- Navbar links -->
+    <div class="collapse navbar-collapse" id="myNavbar">
+      <ul class="nav navbar-nav">
+        <li><a href="/map">Map</a></li>
+        <li><a href="../templates/about.html">About</a></li>
+        <li><a href ="/contact">Contact</a></li>
+      </ul>
+    </div>
+  </div>
+</nav>
+<div class="title-container">
+  <h1 class="title"> Welcome to <p class="italic pulse-title"> PlanetPulse</p></h1>
+  <p class="text" style="font-weight: bold;"><p class="text" style="font-size: 20px;">A HackTheChange 2025 Project</p>
+  <button class="scroll-down" onclick="scrollToContent()">Read More</button>
+<div class="break">
+</div>
+    <section class="hero" id="main-content">
+  <div class="teaser">
+    <!-- Earth background goes here (hidden or masked by default) -->
+    <div class="earth-preview"></div>
+    <div class="overlay">
+      <h1>Explore Our Planet</h1>
+      <div class="iframe-container">
+  <iframe  src="http://127.0.0.1:5000/map" 
+    width="100%" 
+    height="600"
+    style="border:none;"
+    title="3D Map Viewer">"></iframe>
+</div>
+
+
+      <p class="text2">Move your cursor to reveal the world beneath.</p>
+      <button class="explore-btn" style="color: white;"onclick="location.href='map'">See the Globe</button>
+    </div>
+  </div>
+</section>
+<script>
+    function scrollToContent() {
+      const target = document.getElementById("main-content");
+      target.scrollIntoView({ behavior: "smooth" });
+    }
+  </script>
+
+</body>
+</html>

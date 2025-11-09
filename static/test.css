@@ -1,0 +1,21 @@
+body {
+    background-image:url('/static/assets/background.png');
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    background-size: cover;
+}
+
+.navbar-header{
+  width: 200px;
+  background-color: #f4f1e8;/* semi-transparent */
+  padding: 20px;
+  position: fixed;
+  height: 100%;
+  top: 0;
+  left: 0;
+
+}
+
+.icon-bar{
+
+}
