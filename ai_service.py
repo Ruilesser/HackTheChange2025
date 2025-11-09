@@ -61,7 +61,7 @@ class GeminiAdapter(AsyncModelAdapter):
             return f"[gemini] response to: {prompt}"
         
 
-class LocalProcessAdapter(AsyncModelAdapter):
+# class LocalProcessAdapter(AsyncModelAdapter):
     def __init__(self, cmd: str, concurrency: int = 1):
         self.cmd = cmd
         self.semaphore = asyncio.Semaphore(concurrency)
