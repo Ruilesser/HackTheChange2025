@@ -627,8 +627,20 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
     if (countryBordersPending && countryBordersPending.children.length > 0) {
       swapCountryBorders(countryBordersPending);
     } else {
-      // nothing streamed; dispose pending
+      // nothing streamed; dispose pending and fall back to a full (non-stream) request
       if (countryBordersPending) { disposeCountryGroup(countryBordersPending); countryBordersPending = null; }
+      if (addedCountryGeoms === 0) {
+        // Stream returned no segments — try the non-streaming endpoint as a fallback.
+        // This is helpful when server-side tiling/filters exclude segments for the
+        // requested bbox but a full server-side query can still provide useful outlines.
+        console.warn('countries_stream returned no segments; falling back to full /api/countries');
+        try {
+          // request with same simplify value (might be 0.0)
+          fetchCountries(simplify).catch(err => console.warn('fallback fetchCountries failed', err));
+        } catch (e) {
+          console.warn('Fallback fetchCountries invocation failed', e);
+        }
+      }
     }
   } catch (e) {
     console.warn('Failed to swap country borders', e);
@@ -1392,8 +1404,11 @@ function shouldFetchCountries(newLat, newLon, newRadius, newSimplify) {
   const dLat = Math.abs((lastCountriesFetch.lat || 0) - newLat);
   const dLon = Math.abs((lastCountriesFetch.lon || 0) - newLon);
   const metersMoved = Math.sqrt((dLat * 111320) ** 2 + (dLon * 111320) ** 2);
+  // Be less aggressive about suppressing country refreshes. Reduce the
+  // movement threshold so outline updates trigger more readily during
+  // navigation/zoom. Also consider simplify changes as before.
   const simplifyChanged = lastCountriesFetch.simplify === null ? true : (Math.abs((lastCountriesFetch.simplify || 0) - newSimplify) / (lastCountriesFetch.simplify || 1) > 0.35);
-  return metersMoved > 2000 || simplifyChanged;
+  return metersMoved > 200 || simplifyChanged;
 }
 
 /**
