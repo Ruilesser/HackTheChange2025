@@ -108,6 +108,11 @@ scene.add(featurePoints);
 scene.add(featureLines);
 scene.add(countryBorders);
 
+// Overpass rate-limit / cooldown handling
+let overpassCooldownUntil = 0; // ms timestamp until which we should not issue new Overpass requests
+const OVERPASS_COOLDOWN_DEFAULT_MS = 60 * 1000; // 60s cooldown on 429
+function inOverpassCooldown() { return Date.now() < (overpassCooldownUntil || 0); }
+
 // Sprite-based labels (Three.js) for performance and consistent scaling
 const spriteLabels = []; // array of sprites
 // index to deduplicate labels by name or centroid key -> sprite
@@ -218,10 +223,9 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
     params.set('radius', String(radius));
   }
 
-  // include observer (controls.target) so server can perform hemisphere/backface culling
+  // include observer (sub-satellite point computed from camera) so server can perform hemisphere/backface culling
   try {
-    const center = controls.target.clone();
-    const centerLatLon = vector3ToLatLon(center);
+    const centerLatLon = getSubSatelliteLatLon();
     if (centerLatLon && typeof centerLatLon.lat === 'number') {
       params.set('observer_lat', String(centerLatLon.lat));
       params.set('observer_lon', String(centerLatLon.lon));
@@ -526,25 +530,33 @@ function simplifyCoords(coords, maxPoints) {
 }
 
 async function fetchOverpass(lat, lon, radiusMeters) {
-  setStatus('Preparing OSM request — computing radius and method...', 'loading', null);
+  setStatus('Preparing OSM request — computing radius and method...', 'loading', 8000);
   // use streaming endpoint for larger radii to avoid large single responses
   const useStream = radiusMeters > 3000;
   try {
     if (useStream) {
-      await fetchOverpassStream(lat, lon, radiusMeters);
+      // stream with a generous timeout; abort if server is unresponsive
+      await fetchOverpassStream(lat, lon, radiusMeters, 25000);
     } else {
       const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
-      // attach observer center so server can cull far-side features
+      // attach observer center (sub-satellite point computed from camera) so server can cull far-side features
       try {
-        const center = controls.target.clone();
-        const centerLatLon = vector3ToLatLon(center);
+        const centerLatLon = getSubSatelliteLatLon();
         if (centerLatLon && typeof centerLatLon.lat === 'number') {
           qs.set('observer_lat', String(centerLatLon.lat));
           qs.set('observer_lon', String(centerLatLon.lon));
         }
       } catch (e) {}
-      const res = await fetch(`/api/overpass?${qs.toString()}`);
+      setStatus('Requesting Overpass (synchronous) — waiting for server...', 'loading', 15000);
+      // abort if server doesn't respond in time
+      const res = await abortableFetch(`/api/overpass?${qs.toString()}`, { method: 'GET' }, 25000);
       if (!res.ok) {
+        // handle rate-limit specially
+        if (res.status === 429) {
+          overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+          setStatus('Overpass rate limit reached — pausing requests for 60s', 'error', 8000);
+          return;
+        }
         const txt = await res.text();
         throw new Error('Overpass API request failed: ' + txt);
       }
@@ -593,7 +605,7 @@ async function fetchOverpass(lat, lon, radiusMeters) {
   }
 }
 
-async function fetchOverpassStream(lat, lon, radiusMeters) {
+async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
   clearFeatures();
   const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
   // attach observer center so server can cull far-side features
@@ -605,7 +617,18 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
       qs.set('observer_lon', String(centerLatLon.lon));
     }
   } catch (e) {}
-  const res = await fetch(`/api/overpass_stream?${qs.toString()}`);
+  let res;
+  try {
+    setStatus('Requesting Overpass stream — waiting for server...', 'loading', null);
+    res = await abortableFetch(`/api/overpass_stream?${qs.toString()}`, { method: 'GET' }, timeoutMs);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      setStatus('Overpass stream timed out (server did not respond)', 'error', 8000);
+      return;
+    }
+    setStatus('Overpass stream request failed', 'error', 8000);
+    throw err;
+  }
   if (!res.ok) {
     const txt = await res.text();
     setStatus('Overpass stream request failed (server error)', 'error', 8000);
@@ -614,6 +637,7 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
+  let featureCount = 0;
   // prepare frustum/camera direction for local culling
   const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
   const frustum = new THREE.Frustum();
@@ -637,6 +661,18 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
       }
       if (obj._error) {
         console.warn('Overpass tile error', obj);
+        // If server reports Overpass rate limiting (429) for a tile, pause further Overpass queries
+        try {
+          const details = String(obj.details || '').toLowerCase();
+          if (details.includes('429') || details.includes('too many requests')) {
+            overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+            setStatus('Overpass rate limit reached (tile requests) — pausing for 60s', 'error', 8000);
+            try { await reader.cancel(); } catch (e) { /* ignore */ }
+            return; // stop processing the stream
+          }
+        } catch (e) {
+          // ignore parsing errors
+        }
         continue;
       }
       if (obj._meta) {
@@ -730,17 +766,19 @@ document.getElementById('locate-me').addEventListener('click', () => {
       .then(osmData => processOsmJson(JSON.stringify(osmData)))
       .then(processedElements => {
         for (const el of processedElements) {
+          // CORRECT ORDER: lat, lon, imageUrl, elevation
           addIconMarker(
             el.centroid.lat,
             el.centroid.lon,
-            el.base_elev + (el.effective_height || 0.08),
-            el.icon || '/icons/default.svg'
+            el.icon || '/static/icons/default.svg',
+            (el.effective_height || 0) * 0.0001 // Small elevation offset
           );
         }
+        console.log(`Added ${processedElements.length} icon markers`);
       })
       .catch(err => {
-        console.error(err);
-        setStatus('Error processing OSM data', 'error', 5000);
+        console.error('Error processing OSM data for icons:', err);
+        setStatus('Error loading OSM icons', 'error', 5000);
       });
 
   }, (err) => {
@@ -753,9 +791,41 @@ document.getElementById('locate-me').addEventListener('click', () => {
 // helpers: convert 3D vector to lat/lon
 function vector3ToLatLon(v) {
   const r = v.length() || 1;
-  const lat = 90 - Math.acos(v.y / r) * (180 / Math.PI);
-  const lon = Math.atan2(v.z, -v.x) * (180 / Math.PI) - 180;
+  // latitude from asin for numerical stability
+  const lat = Math.asin(v.y / r) * (180 / Math.PI);
+  // reconstruct longitude from x/z using the same convention as latLonToVector3
+  let lon = Math.atan2(v.z, -v.x) * (180 / Math.PI) - 180;
+  // normalize longitude to [-180, 180]
+  while (lon < -180) lon += 360;
+  while (lon > 180) lon -= 360;
   return { lat, lon };
+}
+
+// compute the sub-satellite point (latitude/longitude) from the current camera
+// by intersecting the camera ray with the globe. Falls back to controls.target
+// if there's no intersection (e.g. camera inside the globe).
+function getSubSatelliteLatLon() {
+  try {
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    const o = camera.position.clone();
+    const d = dir.clone().normalize();
+    const R = (modelScaledRadius || RADIUS);
+    const od = o.dot(d);
+    const oo = o.dot(o);
+    const disc = od * od - (oo - R * R);
+    if (disc < 0) {
+      // no intersection; fall back to controls.target
+      const center = controls.target.clone();
+      return vector3ToLatLon(center);
+    }
+    // smallest positive t
+    const t = -od - Math.sqrt(disc);
+    const point = o.add(d.multiplyScalar(t));
+    return vector3ToLatLon(point);
+  } catch (e) {
+    try { return vector3ToLatLon(controls.target.clone()); } catch (er) { return null; }
+  }
 }
 
 // map camera distance to Overpass search radius (meters)
@@ -797,9 +867,21 @@ function shouldFetch(newLat, newLon, newRadius) {
 function scheduleFetchForControls() {
   if (fetchScheduled) clearTimeout(fetchScheduled);
   fetchScheduled = setTimeout(() => {
-    const target = controls.target.clone();
-    const { lat, lon } = vector3ToLatLon(target);
-    const dist = camera.position.distanceTo(target);
+    if (inOverpassCooldown()) {
+      const remaining = Math.ceil((overpassCooldownUntil - Date.now()) / 1000);
+      setStatus(`Overpass rate limit active — waiting ${remaining}s before retrying`, 'error', 4000);
+      return;
+    }
+    const sub = getSubSatelliteLatLon();
+    const { lat, lon } = sub || { lat: null, lon: null };
+    // build a target vector for distance/radius calculation
+    let targetVec = null;
+    if (lat !== null && lon !== null) {
+      targetVec = latLonToVector3(lat, lon, modelScaledRadius || RADIUS);
+    } else {
+      targetVec = controls.target.clone();
+    }
+    const dist = camera.position.distanceTo(targetVec);
     const radius = cameraDistanceToRadius(dist);
     if (shouldFetch(lat, lon, radius)) {
       lastFetch = { lat, lon, radius };
@@ -860,6 +942,10 @@ animate();
 // bbox format: minlat,minlon,maxlat,maxlon
 fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 0.2 });
 
+/* TEST ICONS WORK, uncomment this if you want to see test values
+setTimeout(() => {
+    testIconPlacement();
+}, 2000); */
 
 // -----------------------------------------------------------
 // Utilities
@@ -1018,12 +1104,56 @@ async function processElement(element, iconMap) {
         icon
     };
 }
+        // Abortable fetch helper with timeout (ms)
+        async function abortableFetch(input, init = {}, timeoutMs = 20000) {
+          const controller = new AbortController();
+          const signal = controller.signal;
+          const id = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const res = await fetch(input, Object.assign({}, init, { signal }));
+            clearTimeout(id);
+            return res;
+          } catch (err) {
+            clearTimeout(id);
+            throw err;
+          }
+        }
+
+// Test function to verify icons are working
+function testIconPlacement() {
+  // Clear existing icons
+  clearIconMarkers();
+  
+  // Add test icons at known locations
+  const testLocations = [
+    { lat: 40.7128, lon: -74.0060, name: "New York" },
+    { lat: 51.5074, lon: -0.1278, name: "London" },
+    { lat: 35.6762, lon: 139.6503, name: "Tokyo" },
+    { lat: -33.8688, lon: 151.2093, name: "Sydney" }
+  ];
+  
+  testLocations.forEach(location => {
+    addIconMarker(
+      location.lat,
+      location.lon,
+      '/static/icons/default.svg', // Make sure this icon exists
+      0.02
+    );
+  });
+  
+  console.log('Test icons placed at known locations');
+  setStatus('Test icons placed - check console for errors', 'info', 5000);
+}
+
+// Call this to test icon placement
+// testIconPlacement();
 
 // -----------------------------------------------------------
 // Main entry point
 // -----------------------------------------------------------
 async function getOsmJson(lat, lon, radius = 500) {
     // radius = 500 is the default, can be overwritten by passing a different value
+    if (inOverpassCooldown()) throw new Error('Overpass cooldown active');
     const overpassUrl = "https://overpass-api.de/api/interpreter";
     const query = `
         [out:json];
@@ -1037,16 +1167,35 @@ async function getOsmJson(lat, lon, radius = 500) {
         out skel qt;
     `;
 
-    const response = await fetch(overpassUrl, {
-        method: "POST", // Overpass API expects POST for queries
-        body: query
-    });
-
-    if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+    // Retry with small backoff on transient failures (including occasional 429)
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await fetch(overpassUrl, {
+          method: "POST",
+          body: query
+        });
+        if (!response.ok) {
+          if (response.status === 429) {
+            // respect server rate-limit
+            overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+            setStatus('Overpass rate limit: delaying icon load for 60s', 'error', 8000);
+            throw new Error(`Overpass rate limited (429)`);
+          }
+          const txt = await response.text();
+          throw new Error(`HTTP error! status: ${response.status} - ${txt}`);
+        }
+        return await response.json();
+      } catch (err) {
+        console.warn(`Overpass attempt ${attempt} failed:`, err.message || err);
+        if (attempt < maxAttempts) {
+          const backoff = attempt === 1 ? 1500 : 4000;
+          await new Promise(r => setTimeout(r, backoff));
+          continue;
+        }
+        throw err;
+      }
     }
-
-    return await response.json();
 }
 
 
@@ -1094,127 +1243,157 @@ async function loadOsmFeaturesAt(lat, lon, radius = 500) {
 
 let iconMarkers = [];
 
-function addIconMarker(lat, lon, elevation, imageUrl) {
-  const EARTH_RADIUS = 6371000; // meters
+function addIconMarker(lat, lon, imageUrl, elevation) {
+  // Use the same coordinate system as your globe (radius = 1)
+  const radius = (modelScaledRadius || RADIUS) + 0.02; // Slightly above surface + elevation offset
+  
+  // Use your existing latLonToVector3 function for consistency
+  const position = latLonToVector3(lat, lon, radius);
+  console.log(`Loading icon from: ${imageUrl}`);
+  console.log(`Full URL would be: ${new URL(imageUrl, window.location.origin).href}`);
+  
+  // Create a sprite for the icon with proper error handling
+  const textureLoader = new THREE.TextureLoader();
+  textureLoader.load(
+    imageUrl,
+    (texture) => {
+      const material = new THREE.SpriteMaterial({ 
+        map: texture, 
+        transparent: true,
+        depthTest: true,
+        depthWrite: false
+      });
+      const sprite = new THREE.Sprite(material);
 
-  // Convert lat/lon/elev → XYZ
-  const radius = EARTH_RADIUS + elevation;
-  const phi = (90 - lat) * (Math.PI / 180);
-  const theta = (lon + 180) * (Math.PI / 180);
+      // Much smaller scale - adjust based on your needs
+      const scale = 0.05; // Experiment with this value
+      sprite.scale.set(scale, scale, 1);
+      sprite.position.copy(position);
+      
+      // Ensure icons render above other geometry
+      sprite.renderOrder = 1;
+      
+      scene.add(sprite);
+      iconMarkers.push(sprite);
+      console.log(`Icon placed at (${lat}, ${lon})`);
+    },
+    undefined, // onProgress callback
+    (err) => {
+      console.error('Failed to load icon:', imageUrl, err);
+      // Create a fallback sphere marker
+      createFallbackMarker(position);
+    }
+  );
+}
 
-  const x = radius * Math.sin(phi) * Math.cos(theta);
-  const y = radius * Math.cos(phi);
-  const z = radius * Math.sin(phi) * Math.sin(theta);
-
-  // Create a sprite for the icon
-  const texture = new THREE.TextureLoader().load(imageUrl);
-  const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
-  const sprite = new THREE.Sprite(material);
-
-  // Scale & position
-  sprite.scale.set(10000, 10000, 1);
-  sprite.position.set(x, y, z);
-
-  scene.add(sprite);
-  iconMarkers.push(sprite);
-  return sprite;
+// Fallback marker for missing icons
+function createFallbackMarker(position) {
+  const geometry = new THREE.SphereGeometry(0.01, 8, 8);
+  const material = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+  const marker = new THREE.Mesh(geometry, material);
+  marker.position.copy(position);
+  scene.add(marker);
+  iconMarkers.push(marker);
 }
 
 function clearIconMarkers() {
   for (const marker of iconMarkers) {
     scene.remove(marker);
-    marker.geometry?.dispose(); // clean up geometry if needed
-    marker.material?.dispose(); // clean up material if needed
+    if (marker.geometry) marker.geometry.dispose();
+    if (marker.material) {
+      if (marker.material.map) marker.material.map.dispose();
+      marker.material.dispose();
+    }
   }
-  iconMarkers = []; // reset the array
+  iconMarkers = [];
 }
 
 
 const ICON_MAP = {
     "amenity": { 
-        "bar": "icons/amenity_recreational.svg",
-        "bbq": "icons/amenity_recreational.svg",
-        "brothel": "icons/amenity_recreational.svg",
-        "cafe": "icons/amenity_recreational.svg",
-        "cinema": "icons/amenity_recreational.svg",
-        "food_court": "icons/amenity_recreational.svg",
-        "marketplace": "icons/amenity_recreational.svg",
-        "nightclub": "icons/amenity_recreational.svg",
-        "restaurant": "icons/amenity_recreational.svg",
-        "swinger_club": "icons/amenity_recreational.svg",
-        "theatre": "icons/amenity_recreational.svg",
-        "vending_machine": "icons/amenity_recreational.svg",
-        "bicycle_parking": "icons/amenity_vehicle.svg",
-        "bicycle_rental": "icons/amenity_vehicle.svg",
-        "car_rental": "icons/amenity_vehicle.svg",
-        "car_sharing": "icons/amenity_vehicle.svg",
-        "fuel": "icons/amenity_vehicle.svg",
-        "parking": "icons/amenity_vehicle.svg",
-        "charging_station": "icons/amenity_charging_station.svg",
-        "clinic": "icons/health.svg",
-        "dentist": "icons/health.svg",
-        "doctors": "icons/health.svg",
-        "hospital": "icons/health.svg",
-        "pharmacy": "icons/health.svg",
-        "college": "icons/amenity_education.svg",
-        "kindergarten": "icons/amenity_education.svg",
-        "school": "icons/amenity_education.svg",
-        "courthouse": "icons/amenity_public_building.svg",
-        "fire_station": "icons/emergency_fire_station.svg",
-        "police": "icons/emergency_police.svg",
-        "ferry_terminal": "icons/amenity_ferry_terminal.svg",
-        "grave_yard": "icons/amenity_grave_yard.svg",
-        "library": "icons/amenity_library.svg",
-        "place_of_worship": "icons/amenity_place_of_worship.svg",
-        "post_box": "icons/amenity_post.svg",
-        "post_office": "icons/amenity_post.svg",
-        "prison": "icons/amenity_prison.svg",
-        "public_building": "icons/amenity_public_building.svg",
-        "recycling": "icons/amenity_recycling.svg",
-        "shelter": "icons/amenity_shelter.svg",
-        "taxi": "icons/amenity_taxi.svg",
-        "telephone": "icons/amenity_telephone.svg",
-        "toilets": "icons/amenity_toilets.svg",
-        "townhall": "icons/amenity_public_building.svg",
-        "drinking_water": "icons/water.svg",
-        "water_point": "icons/water.svg",
-        "_default": "icons/amenity.svg"
+        "bar": "/static/icons/amenity_recreational.svg",
+        "bbq": "/static/icons/amenity_recreational.svg",
+        "brothel": "/static/icons/amenity_recreational.svg",
+        "cafe": "/static/icons/amenity_recreational.svg",
+        "cinema": "/static/icons/amenity_recreational.svg",
+        "food_court": "/static/icons/amenity_recreational.svg",
+        "marketplace": "/static/icons/amenity_recreational.svg",
+        "nightclub": "/static/icons/amenity_recreational.svg",
+        "restaurant": "/static/icons/amenity_recreational.svg",
+        "swinger_club": "/static/icons/amenity_recreational.svg",
+        "theatre": "/static/icons/amenity_recreational.svg",
+        "vending_machine": "/static/icons/amenity_recreational.svg",
+        "bicycle_parking": "/static/icons/amenity_vehicle.svg",
+        "bicycle_rental": "/static/icons/amenity_vehicle.svg",
+        "car_rental": "/static/icons/amenity_vehicle.svg",
+        "car_sharing": "/static/icons/amenity_vehicle.svg",
+        "fuel": "/static/icons/amenity_vehicle.svg",
+        "parking": "/static/icons/amenity_vehicle.svg",
+        "charging_station": "/static/icons/amenity_charging_station.svg",
+        "clinic": "/static/icons/health.svg",
+        "dentist": "/static/icons/health.svg",
+        "doctors": "/static/icons/health.svg",
+        "hospital": "/static/icons/health.svg",
+        "pharmacy": "/static/icons/health.svg",
+        "college": "/static/icons/amenity_education.svg",
+        "kindergarten": "/static/icons/amenity_education.svg",
+        "school": "/static/icons/amenity_education.svg",
+        "courthouse": "/static/icons/amenity_public_building.svg",
+        "fire_station": "/static/icons/emergency_fire_station.svg",
+        "police": "/static/icons/emergency_police.svg",
+        "ferry_terminal": "/static/icons/amenity_ferry_terminal.svg",
+        "grave_yard": "/static/icons/amenity_grave_yard.svg",
+        "library": "/static/icons/amenity_library.svg",
+        "place_of_worship": "/static/icons/amenity_place_of_worship.svg",
+        "post_box": "/static/icons/amenity_post.svg",
+        "post_office": "/static/icons/amenity_post.svg",
+        "prison": "/static/icons/amenity_prison.svg",
+        "public_building": "/static/icons/amenity_public_building.svg",
+        "recycling": "/static/icons/amenity_recycling.svg",
+        "shelter": "/static/icons/amenity_shelter.svg",
+        "taxi": "/static/icons/amenity_taxi.svg",
+        "telephone": "/static/icons/amenity_telephone.svg",
+        "toilets": "/static/icons/amenity_toilets.svg",
+        "townhall": "/static/icons/amenity_public_building.svg",
+        "drinking_water": "/static/icons/water.svg",
+        "water_point": "/static/icons/water.svg",
+        "_default": "/static/icons/amenity.svg"
     },
-    "natural": { "_default": "icons/natural.svg" },
+    "natural": { "_default": "/static/icons/natural.svg" },
     "emergency": {
-        "ambulance_station": "icons/emergency_ambulance_station.svg",
-        "fire_station": "icons/emergency_fire_station.svg",
-        "lifeguard_station": "icons/emergency_lifeguard_station.svg",
-        "police": "icons/emergency_police.svg",
-        "first_aid": "icons/emergency_first_aid.svg",
-        "defibrillator": "icons/emergency_first_aid.svg",
-        "assembly_point": "icons/emergency_assembly_point.svg",
-        "_default": "icons/emergency.svg"
+        "ambulance_station": "/static/icons/emergency_ambulance_station.svg",
+        "fire_station": "/static/icons/emergency_fire_station.svg",
+        "lifeguard_station": "/static/icons/emergency_lifeguard_station.svg",
+        "police": "/static/icons/emergency_police.svg",
+        "first_aid": "/static/icons/emergency_first_aid.svg",
+        "defibrillator": "/static/icons/emergency_first_aid.svg",
+        "assembly_point": "/static/icons/emergency_assembly_point.svg",
+        "_default": "/static/icons/emergency.svg"
     },
-    "aerialway":   { "_default": "icons/aerialway.svg" },
-    "aeroway":     { "_default": "icons/aerialway.svg" },
-    "barrier":     { "_default": "icons/barrier.svg" },
-    "boundary":    { "_default": "icons/barrier.svg" },
-    "building":    { "_default": "icons/building.svg" },
-    "craft":       { "_default": "icons/craft.svg" },
-    "geological":  { "_default": "icons/geological.svg" },
-    "healthcare":  { "_default": "icons/health.svg" },
-    "highway":     { "_default": "icons/highway.svg" },
-    "historic":    { "_default": "icons/historic.svg" },
-    "landuse":     { "_default": "icons/landuse.svg" },
-    "leisure":     { "_default": "icons/leisure.svg" },
-    "man_made":    { "_default": "icons/man_made.svg" },
-    "military":    { "_default": "icons/military.svg" },
-    "office":      { "_default": "icons/office.svg" },
-    "place":       { "_default": "icons/place.svg" },
-    "power":       { "_default": "icons/power.svg" },
-    "public_transport": { "_default": "icons/public_transport.svg" },
-    "railway":     { "_default": "icons/route.svg" },
-    "route":       { "_default": "icons/route.svg" },
-    "shop":        { "_default": "icons/shop.svg" },
-    "telecom":     { "_default": "icons/telecom.svg" },
-    "tourism":     { "_default": "icons/tourism.svg" },
-    "water":       { "_default": "icons/water.svg" },
-    "waterway":    { "_default": "icons/water.svg" },
-    "_global_default": { "_default": "icons/default.svg" }
+    "aerialway":   { "_default": "/static/icons/aerialway.svg" },
+    "aeroway":     { "_default": "/static/icons/aerialway.svg" },
+    "barrier":     { "_default": "/static/icons/barrier.svg" },
+    "boundary":    { "_default": "/static/icons/barrier.svg" },
+    "building":    { "_default": "/static/icons/building.svg" },
+    "craft":       { "_default": "/static/icons/craft.svg" },
+    "geological":  { "_default": "/static/icons/geological.svg" },
+    "healthcare":  { "_default": "/static/icons/health.svg" },
+    "highway":     { "_default": "/static/icons/highway.svg" },
+    "historic":    { "_default": "/static/icons/historic.svg" },
+    "landuse":     { "_default": "/static/icons/landuse.svg" },
+    "leisure":     { "_default": "/static/icons/leisure.svg" },
+    "man_made":    { "_default": "/static/icons/man_made.svg" },
+    "military":    { "_default": "/static/icons/military.svg" },
+    "office":      { "_default": "/static/icons/office.svg" },
+    "place":       { "_default": "/static/icons/place.svg" },
+    "power":       { "_default": "/static/icons/power.svg" },
+    "public_transport": { "_default": "/static/icons/public_transport.svg" },
+    "railway":     { "_default": "/static/icons/route.svg" },
+    "route":       { "_default": "/static/icons/route.svg" },
+    "shop":        { "_default": "/static/icons/shop.svg" },
+    "telecom":     { "_default": "/static/icons/telecom.svg" },
+    "tourism":     { "_default": "/static/icons/tourism.svg" },
+    "water":       { "_default": "/static/icons/water.svg" },
+    "waterway":    { "_default": "/static/icons/water.svg" },
+    "_global_default": { "_default": "/static/icons/default.svg" }
 };
