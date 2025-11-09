@@ -108,6 +108,11 @@ scene.add(featurePoints);
 scene.add(featureLines);
 scene.add(countryBorders);
 
+// Overpass rate-limit / cooldown handling
+let overpassCooldownUntil = 0; // ms timestamp until which we should not issue new Overpass requests
+const OVERPASS_COOLDOWN_DEFAULT_MS = 60 * 1000; // 60s cooldown on 429
+function inOverpassCooldown() { return Date.now() < (overpassCooldownUntil || 0); }
+
 // Sprite-based labels (Three.js) for performance and consistent scaling
 const spriteLabels = []; // array of sprites
 // index to deduplicate labels by name or centroid key -> sprite
@@ -546,6 +551,12 @@ async function fetchOverpass(lat, lon, radiusMeters) {
       // abort if server doesn't respond in time
       const res = await abortableFetch(`/api/overpass?${qs.toString()}`, { method: 'GET' }, 25000);
       if (!res.ok) {
+        // handle rate-limit specially
+        if (res.status === 429) {
+          overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+          setStatus('Overpass rate limit reached — pausing requests for 60s', 'error', 8000);
+          return;
+        }
         const txt = await res.text();
         throw new Error('Overpass API request failed: ' + txt);
       }
@@ -650,6 +661,18 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
       }
       if (obj._error) {
         console.warn('Overpass tile error', obj);
+        // If server reports Overpass rate limiting (429) for a tile, pause further Overpass queries
+        try {
+          const details = String(obj.details || '').toLowerCase();
+          if (details.includes('429') || details.includes('too many requests')) {
+            overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+            setStatus('Overpass rate limit reached (tile requests) — pausing for 60s', 'error', 8000);
+            try { await reader.cancel(); } catch (e) { /* ignore */ }
+            return; // stop processing the stream
+          }
+        } catch (e) {
+          // ignore parsing errors
+        }
         continue;
       }
       if (obj._meta) {
@@ -844,6 +867,11 @@ function shouldFetch(newLat, newLon, newRadius) {
 function scheduleFetchForControls() {
   if (fetchScheduled) clearTimeout(fetchScheduled);
   fetchScheduled = setTimeout(() => {
+    if (inOverpassCooldown()) {
+      const remaining = Math.ceil((overpassCooldownUntil - Date.now()) / 1000);
+      setStatus(`Overpass rate limit active — waiting ${remaining}s before retrying`, 'error', 4000);
+      return;
+    }
     const sub = getSubSatelliteLatLon();
     const { lat, lon } = sub || { lat: null, lon: null };
     // build a target vector for distance/radius calculation
