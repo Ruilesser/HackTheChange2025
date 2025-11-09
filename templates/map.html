@@ -17,8 +17,19 @@
     <div id="map-root">
       <div id="map-container"></div>
       <div id="ui">
-        <button id="locate-me">Locate me</button>
-        <span id="status" aria-live="polite" style="margin-left:12px;color:#ddd"></span>
+        <!-- The locate button is positioned top-right to avoid overlapping the FPS panel. -->
+  <button id="locate-me" title="Locate me" style="position:fixed; right:12px; top:12px; z-index:10001; display:flex; align-items:center; gap:6px; padding:6px 8px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.08); color:#fff;">
+          <!-- simple location SVG icon -->
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path d="M12 8a4 4 0 100 8 4 4 0 000-8z" stroke="#fff" stroke-width="1.2" fill="rgba(255,255,255,0.05)"/>
+            <path d="M12 2v2" stroke="#fff" stroke-width="1.2" stroke-linecap="round"/>
+            <path d="M12 20v2" stroke="#fff" stroke-width="1.2" stroke-linecap="round"/>
+            <path d="M2 12h2" stroke="#fff" stroke-width="1.2" stroke-linecap="round"/>
+            <path d="M20 12h2" stroke="#fff" stroke-width="1.2" stroke-linecap="round"/>
+          </svg>
+          <span style="font-size:13px;">Locate me</span>
+        </button>
+  <span id="status" aria-live="polite" style="margin-left:12px;color:#ddd; position: fixed; left:12px; top:48px; z-index:10000;">&nbsp;</span>
       </div>
     </div>
 
