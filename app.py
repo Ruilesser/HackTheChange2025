@@ -133,12 +133,9 @@ def api_overpass():
 
     bbox_str = f"{minlat},{minlon},{maxlat},{maxlon}"
     
-    # optional observer for server-side hemisphere/backface culling
-    observer_lat = request.args.get('observer_lat', type=float)
-    observer_lon = request.args.get('observer_lon', type=float)
-    observer_vec = None
-    if observer_lat is not None and observer_lon is not None:
-        observer_vec = _latlon_to_unit_vec(observer_lat, observer_lon)
+    # NOTE: visibility/backface-culling by observer is intentionally disabled.
+    # Any observer_lat/observer_lon parameters are ignored to avoid
+    # server-side visibility tests — the client controls visibility rendering.
 
     overpass_q = f"""
 [out:json][timeout:25];
@@ -296,22 +293,7 @@ out geom;
 
     geojson = {"type": "FeatureCollection", "features": features}
 
-    # server-side hemisphere/backface culling: if an observer is provided,
-    # exclude features whose representative point lies on the far side of the globe
-    if observer_vec is not None:
-        filtered = []
-        for feat in features:
-            geom = feat.get('geometry')
-            lat_rep, lon_rep = _rep_latlon_from_geom(geom)
-            if lat_rep is None or lon_rep is None:
-                # keep features we cannot classify
-                filtered.append(feat)
-                continue
-            v = _latlon_to_unit_vec(lat_rep, lon_rep)
-            dot = v[0] * observer_vec[0] + v[1] * observer_vec[1] + v[2] * observer_vec[2]
-            if dot > 0:
-                filtered.append(feat)
-        geojson['features'] = filtered
+    # No server-side visibility filtering applied; return all assembled features.
 
     elapsed = time.time() - start_time
     app.logger.debug(f"Overpass query time: {elapsed:.2f}s, features: {len(geojson.get('features', []))}")
@@ -352,12 +334,7 @@ def api_overpass_stream():
     # tiling parameters
     lat_span = maxlat - minlat
     lon_span = maxlon - minlon
-    # optional observer for hemisphere/backface culling
-    observer_lat = request.args.get('observer_lat', type=float)
-    observer_lon = request.args.get('observer_lon', type=float)
-    observer_vec = None
-    if observer_lat is not None and observer_lon is not None:
-        observer_vec = _latlon_to_unit_vec(observer_lat, observer_lon)
+    # NOTE: server-side observer visibility tests removed — always emit tile features.
     tile_deg = 0.02
     nx = min(8, max(1, int(math.ceil(lon_span / tile_deg))))
     ny = min(8, max(1, int(math.ceil(lat_span / tile_deg))))
@@ -510,16 +487,7 @@ out geom;
                     continue
                 feats = assemble_features_from_elements(elems_t)
                 for f in feats:
-                    # server-side hemisphere/backface culling per-feature (optional)
-                    if observer_vec is not None:
-                        geom = f.get('geometry')
-                        lat_rep, lon_rep = _rep_latlon_from_geom(geom)
-                        if lat_rep is not None and lon_rep is not None:
-                            v = _latlon_to_unit_vec(lat_rep, lon_rep)
-                            dot = v[0] * observer_vec[0] + v[1] * observer_vec[1] + v[2] * observer_vec[2]
-                            if dot <= 0:
-                                # behind the globe relative to the observer, skip
-                                continue
+                    # Always emit features for the tile; client-side controls visibility.
                     yield json.dumps(f) + "\n"
         yield json.dumps({"_meta": {"status": "done"}}) + "\n"
 
@@ -1027,11 +995,86 @@ def api_countries():
     except Exception:
         simplify = 0.1
 
+    # Allow optional bbox or lat/lon+radius to return only the visible subset
+    bbox = request.args.get('bbox')
+    lat = request.args.get('lat', type=float)
+    lon = request.args.get('lon', type=float)
+    radius = request.args.get('radius', type=float)
+
     data = get_country_boundaries(simplify_tol=simplify)
-    if data is None:
-        # fallback to empty collection (shouldn't happen with updated get_country_boundaries)
+    if data is None or 'features' not in data:
         return jsonify({'type': 'FeatureCollection', 'features': []})
-    return jsonify(data)
+
+    # If no spatial filter requested, return full collection
+    if not bbox and (lat is None or lon is None or radius is None):
+        return jsonify(data)
+
+    # compute bbox from lat/lon/radius when provided
+    if not bbox:
+        lat_delta = radius / 111320.0
+        lon_delta = radius / (111320.0 * max(0.00001, abs(math.cos(math.radians(lat)))) )
+        minlat = lat - lat_delta
+        maxlat = lat + lat_delta
+        minlon = lon - lon_delta
+        maxlon = lon + lon_delta
+    else:
+        try:
+            parts = [float(p) for p in bbox.split(',')]
+            if len(parts) != 4:
+                raise ValueError()
+            minlat, minlon, maxlat, maxlon = parts
+        except Exception:
+            return jsonify({"error": "Invalid bbox format. Use minlat,minlon,maxlat,maxlon"}), 400
+
+    # Try shapely to robustly test intersection. If not available, fallback to bbox-coordinate check.
+    try:
+        from shapely.geometry import shape, box
+        shapely_ok = True
+    except Exception:
+        shapely_ok = False
+
+    filtered = []
+    if shapely_ok:
+        target_box = box(minlon, minlat, maxlon, maxlat)
+        for feat in data.get('features', []):
+            geom = feat.get('geometry')
+            if not geom:
+                continue
+            try:
+                gshape = shape(geom)
+                if gshape.intersects(target_box):
+                    filtered.append(feat)
+            except Exception:
+                # on error, include the feature conservatively
+                filtered.append(feat)
+    else:
+        # Fallback: check coordinates for any point inside bbox
+        def any_in_ring(ring):
+            for lonv, latv in ring:
+                if minlat <= latv <= maxlat and minlon <= lonv <= maxlon:
+                    return True
+            return False
+
+        for feat in data.get('features', []):
+            geom = feat.get('geometry')
+            if not geom:
+                continue
+            gtype = geom.get('type')
+            coords = geom.get('coordinates')
+            included = False
+            try:
+                if gtype == 'LineString':
+                    if any_in_ring(coords): included = True
+                elif gtype == 'MultiLineString':
+                    for part in coords:
+                        if any_in_ring(part):
+                            included = True; break
+            except Exception:
+                included = True
+            if included:
+                filtered.append(feat)
+
+    return jsonify({'type': 'FeatureCollection', 'features': filtered})
 
 
 @app.route('/api/countries_stream')
@@ -1093,12 +1136,7 @@ def api_countries_stream():
     if shapely_ok:
         target_box = box(minlon, minlat, maxlon, maxlat)
 
-    # optional server-side observer for hemisphere/backface culling
-    observer_lat = request.args.get('observer_lat', type=float)
-    observer_lon = request.args.get('observer_lon', type=float)
-    observer_vec = None
-    if observer_lat is not None and observer_lon is not None:
-        observer_vec = _latlon_to_unit_vec(observer_lat, observer_lon)
+    # NOTE: visibility/backface culling disabled on server — always stream country features
 
     def gen():
         count = 0
@@ -1132,17 +1170,7 @@ def api_countries_stream():
                         out_props['centroid'] = [c_lon, c_lat]
                     out_props['label_priority'] = priority
                     out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': out_props }
-                    # server-side backface culling: if observer provided and centroid exists, skip far-side features
-                    if observer_vec is not None and 'centroid' in out_props:
-                        try:
-                            c_lon, c_lat = float(out_props['centroid'][0]), float(out_props['centroid'][1])
-                            v = _latlon_to_unit_vec(c_lat, c_lon)
-                            dot = v[0] * observer_vec[0] + v[1] * observer_vec[1] + v[2] * observer_vec[2]
-                            if dot <= 0:
-                                # not visible from observer hemisphere
-                                continue
-                        except Exception:
-                            pass
+                    # Always yield the feature (no server-side visibility culling).
                     yield json.dumps(out) + "\n"
                     count += 1
                 else:
@@ -1190,16 +1218,7 @@ def api_countries_stream():
                     # priority fallback: number of points
                     out_props['label_priority'] = float(len(all_pts) if 'all_pts' in locals() else 0)
                     out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': out_props }
-                    # fallback path: perform same centroid-based backface cull if possible
-                    if observer_vec is not None and out_props.get('centroid'):
-                        try:
-                            c_lon, c_lat = float(out_props['centroid'][0]), float(out_props['centroid'][1])
-                            v = _latlon_to_unit_vec(c_lat, c_lon)
-                            dot = v[0] * observer_vec[0] + v[1] * observer_vec[1] + v[2] * observer_vec[2]
-                            if dot <= 0:
-                                continue
-                        except Exception:
-                            pass
+                    # Fallback: always yield (no server-side visibility culling)
                     yield json.dumps(out) + "\n"
                     count += 1
             except Exception as e:
