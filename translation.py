@@ -48,7 +48,7 @@ def parse_height(tags):
     return {
         "height": height,
         "min_height": min_height,
-        "effective_height": max(0.0, height - min_height)
+        "effective_height": max(0.0, height - min_height) # USE THIS FOR HEIGHT ON MAP
     }
 
 # -----------------------------------------------------------
@@ -100,7 +100,7 @@ def process_element(element):
     height_info = parse_height(element['tags']) if is_building(element) else {
         "height": 0.0,
         "min_height": 0.0,
-        "effective_height": 0.0
+        "effective_height": 0.0 # USE THIS
     }
 
     return {
@@ -127,3 +127,4 @@ def process_osm_json(json_string):
     all_elements = extract_elements(osm_data)
     processed = [process_element(el) for el in all_elements]
     return processed
+# for any buildings with height, please use effective_height
