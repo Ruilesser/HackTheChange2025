@@ -170,6 +170,18 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
     params.set('radius', String(radius));
   }
 
+  // include observer (controls.target) so server can perform hemisphere/backface culling
+  try {
+    const center = controls.target.clone();
+    const centerLatLon = vector3ToLatLon(center);
+    if (centerLatLon && typeof centerLatLon.lat === 'number') {
+      params.set('observer_lat', String(centerLatLon.lat));
+      params.set('observer_lon', String(centerLatLon.lon));
+    }
+  } catch (e) {
+    // ignore
+  }
+
   const res = await fetch(`/api/countries_stream?${params.toString()}`);
   if (!res.ok) {
     const txt = await res.text();
@@ -181,6 +193,13 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
   let buf = '';
   // placeholder for labels or additional metadata
   const pendingLabels = [];
+  // prepare camera frustum and direction once for this streaming session
+  const camDir = new THREE.Vector3();
+  camera.getWorldDirection(camDir);
+  const frustum = new THREE.Frustum();
+  const projScreenMatrix = new THREE.Matrix4();
+  projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  frustum.setFromProjectionMatrix(projScreenMatrix);
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -200,6 +219,23 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       // expect feature with geometry LineString/MultiLineString
       const geom = obj.geometry;
       if (!geom) continue;
+      // culling: determine representative lat/lon for geometry (server may have added centroid)
+      let repLat = null, repLon = null;
+      if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
+        repLon = parseFloat(obj.properties.centroid[0]);
+        repLat = parseFloat(obj.properties.centroid[1]);
+      } else {
+        const rep = geometryRepresentativeLatLon(geom);
+        if (rep) { repLat = rep.lat; repLon = rep.lon; }
+      }
+      if (repLat !== null && repLon !== null) {
+        const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
+        // backface: check facing relative to camera direction
+        const toPoint = worldPos.clone().sub(camera.position).normalize();
+        if (toPoint.dot(camDir) <= 0) continue; // behind globe
+        // frustum test: skip if outside view frustum
+        if (!frustum.containsPoint(worldPos)) continue;
+      }
       if (geom.type === 'LineString') {
         renderCountryLine(geom.coordinates, 0xffffff, 1);
       } else if (geom.type === 'MultiLineString') {
@@ -235,8 +271,26 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       const obj = JSON.parse(buf.trim());
       if (obj && obj.geometry) {
         const geom = obj.geometry;
-        if (geom.type === 'LineString') renderCountryLine(geom.coordinates, 0xffffff, 1);
-        else if (geom.type === 'MultiLineString') for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+        // final item: apply same lightweight culling
+        let repLat = null, repLon = null;
+        if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
+          repLon = parseFloat(obj.properties.centroid[0]);
+          repLat = parseFloat(obj.properties.centroid[1]);
+        } else {
+          const rep = geometryRepresentativeLatLon(geom);
+          if (rep) { repLat = rep.lat; repLon = rep.lon; }
+        }
+        if (repLat !== null && repLon !== null) {
+          const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
+          const toPoint = worldPos.clone().sub(camera.position).normalize();
+          if (toPoint.dot(camDir) > 0 && frustum.containsPoint(worldPos)) {
+            if (geom.type === 'LineString') renderCountryLine(geom.coordinates, 0xffffff, 1);
+            else if (geom.type === 'MultiLineString') for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+          }
+        } else {
+          if (geom.type === 'LineString') renderCountryLine(geom.coordinates, 0xffffff, 1);
+          else if (geom.type === 'MultiLineString') for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+        }
       }
     } catch (e) {
       // ignore
@@ -421,16 +475,47 @@ async function fetchOverpass(lat, lon, radiusMeters) {
       await fetchOverpassStream(lat, lon, radiusMeters);
     } else {
       const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
+      // attach observer center so server can cull far-side features
+      try {
+        const center = controls.target.clone();
+        const centerLatLon = vector3ToLatLon(center);
+        if (centerLatLon && typeof centerLatLon.lat === 'number') {
+          qs.set('observer_lat', String(centerLatLon.lat));
+          qs.set('observer_lon', String(centerLatLon.lon));
+        }
+      } catch (e) {}
       const res = await fetch(`/api/overpass?${qs.toString()}`);
       if (!res.ok) {
         const txt = await res.text();
         throw new Error('Overpass API request failed: ' + txt);
       }
       const geojson = await res.json();
+      // prepare frustum / camera direction for client-side culling
+      const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
+      const frustum = new THREE.Frustum();
+      const projScreenMatrix = new THREE.Matrix4();
+      projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+      frustum.setFromProjectionMatrix(projScreenMatrix);
+
       clearFeatures();
       for (const feat of geojson.features || []) {
         const geom = feat.geometry;
         if (!geom) continue;
+        // determine representative lat/lon
+        let repLat = null, repLon = null;
+        if (feat.properties && feat.properties.centroid && feat.properties.centroid.length >= 2) {
+          repLon = parseFloat(feat.properties.centroid[0]);
+          repLat = parseFloat(feat.properties.centroid[1]);
+        } else {
+          const rep = geometryRepresentativeLatLon(geom);
+          if (rep) { repLat = rep.lat; repLon = rep.lon; }
+        }
+        if (repLat !== null && repLon !== null) {
+          const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
+          const toPoint = worldPos.clone().sub(camera.position).normalize();
+          if (toPoint.dot(camDir) <= 0) continue; // behind globe
+          if (!frustum.containsPoint(worldPos)) continue; // outside view
+        }
         if (geom.type === 'Point') {
           const [lon, lat] = geom.coordinates;
           renderPoint(lat, lon, 0xff5533, 0.02);
@@ -452,6 +537,15 @@ async function fetchOverpass(lat, lon, radiusMeters) {
 async function fetchOverpassStream(lat, lon, radiusMeters) {
   clearFeatures();
   const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
+  // attach observer center so server can cull far-side features
+  try {
+    const center = controls.target.clone();
+    const centerLatLon = vector3ToLatLon(center);
+    if (centerLatLon && typeof centerLatLon.lat === 'number') {
+      qs.set('observer_lat', String(centerLatLon.lat));
+      qs.set('observer_lon', String(centerLatLon.lon));
+    }
+  } catch (e) {}
   const res = await fetch(`/api/overpass_stream?${qs.toString()}`);
   if (!res.ok) {
     const txt = await res.text();
@@ -460,6 +554,12 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
+  // prepare frustum/camera direction for local culling
+  const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
+  const frustum = new THREE.Frustum();
+  const projScreenMatrix = new THREE.Matrix4();
+  projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  frustum.setFromProjectionMatrix(projScreenMatrix);
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -486,6 +586,21 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
       // treat as GeoJSON Feature
       const geom = obj.geometry;
       if (!geom) continue;
+      // lightweight client-side culling: find rep lat/lon and test frustum/backface
+      let repLat = null, repLon = null;
+      if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
+        repLon = parseFloat(obj.properties.centroid[0]);
+        repLat = parseFloat(obj.properties.centroid[1]);
+      } else {
+        const rep = geometryRepresentativeLatLon(geom);
+        if (rep) { repLat = rep.lat; repLon = rep.lon; }
+      }
+      if (repLat !== null && repLon !== null) {
+        const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.005);
+        const toPoint = worldPos.clone().sub(camera.position).normalize();
+        if (toPoint.dot(camDir) <= 0) continue;
+        if (!frustum.containsPoint(worldPos)) continue;
+      }
       if (geom.type === 'Point') {
         const [lon, lat] = geom.coordinates;
         renderPoint(lat, lon, 0xff5533, 0.02);
