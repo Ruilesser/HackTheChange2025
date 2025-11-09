@@ -9,6 +9,8 @@ body {
   background-repeat: no-repeat;
   background-attachment: fixed;
   background-size: cover;
+  margin:0 ;
+  padding-top: 60px;
 }
 
 .navbar{
@@ -39,9 +41,14 @@ nav a{
   text-align: center; 
   padding-top: 40px;
   font-family: RadleyRegular;
+  font-size: 50px;
 }
 
 .active {
   background-color: #f4f1e8;
   color: #9b4819;
+}
+
+.italic {
+    font-family: RadleyItalic;
 }
