@@ -581,7 +581,7 @@ function animate() {
   controls.update();
   renderer.render(scene, camera);
   // update labels after render to ensure camera/projection are current
-  updateCountryLabels();
+  updateLabelSprites();
 }
 
 animate();
