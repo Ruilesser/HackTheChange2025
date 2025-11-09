@@ -12,6 +12,11 @@ from shapely.geometry import shape, Point
 
 app = Flask(__name__)
 
+import logging as _logging
+_logging.basicConfig(level=_logging.DEBUG)
+app.logger.setLevel(_logging.DEBUG)
+app.logger.debug("App starting; static_folder=%s", app.static_folder)
+
 # --- Overpass tuning constants ---
 OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter"
 TILE_DEG = 0.01                 # smaller tile size (deg). Lower -> more tiles, fewer elements per tile
@@ -33,7 +38,10 @@ def clamp_lat(lat):
 def clamp_lon(lon):
     try:
         lon = float(lon)
-        # normalize into [-180,180)
+        # Keep exact 180.0 as 180 (so global bbox -180..180 remains valid).
+        # Otherwise normalize into [-180,180).
+        if abs(lon - 180.0) < 1e-9:
+            return 180.0
         return ((lon + 180.0) % 360.0) - 180.0
     except Exception:
         return None
@@ -304,19 +312,14 @@ def api_overpass():
     else:
         return jsonify({'error':'provide bbox or lat+lon+radius'}), 400
 
-    # Normalize longitudes into [-180,180]
-    minlon = normalize_lon(minlon)
-    maxlon = normalize_lon(maxlon)
+    # Keep original values for logging / meta
+    orig_bbox = [minlat, minlon, maxlat, maxlon]
 
-    # If bbox crosses the antimeridian after normalization (minlon > maxlon),
-    # split into two queries and merge results.
-    bboxes = []
-    if minlon <= maxlon:
-        bboxes.append((minlat, minlon, maxlat, maxlon))
-    else:
-        # split into two: [minlon..180] and [-180..maxlon]
-        bboxes.append((minlat, minlon, maxlat, 180.0))
-        bboxes.append((minlat, -180.0, maxlat, maxlon))
+    # Use shared normalizer/splitter to produce valid query bboxes
+    bboxes = normalize_and_split_bbox(minlat, minlon, maxlat, maxlon)
+    if not bboxes:
+        return jsonify({'error': 'invalid bbox after normalization/clamping'}), 400
+    app.logger.debug("api_overpass original bbox: %s normalized/split -> %s", orig_bbox, bboxes)
 
     features = []
     try:
@@ -369,28 +372,25 @@ def api_overpass_stream():
     else:
         return jsonify({'_error':'provide bbox or lat+lon+radius'}), 400
 
-    # Normalize longitudes
-    minlon = normalize_lon(minlon)
-    maxlon = normalize_lon(maxlon)
+    # Keep original for client-visible metadata
+    orig_bbox = [minlat, minlon, maxlat, maxlon]
 
-    # if crosses antimeridian, produce two bbox ranges
-    bboxes = []
-    if minlon <= maxlon:
-        bboxes.append((minlat, minlon, maxlat, maxlon))
-    else:
-        bboxes.append((minlat, minlon, maxlat, 180.0))
-        bboxes.append((minlat, -180.0, maxlat, maxlon))
+    # Normalize & split using shared helper (handles antimeridian)
+    bboxes = normalize_and_split_bbox(minlat, minlon, maxlat, maxlon)
+    if not bboxes:
+        return jsonify({'_error': 'invalid bbox after normalization/clamping'}), 400
+    app.logger.debug("api_overpass_stream original bbox: %s normalized/split -> %s", orig_bbox, bboxes)
 
     def generate():
-        yield json.dumps({'_meta':{'status':'start','bbox':[minlat,minlon,maxlat,maxlon]}}) + '\n'
+        yield json.dumps({'_meta':{'status':'start','orig_bbox': orig_bbox, 'queried_bboxes': bboxes}}) + '\n'
         for (mlat, mlon, xlat, xlon) in bboxes:
-            for feat in stream_overpass_tiles(mlat, mlon, xlat, xlon, tag_filters=tag_filters, tile_deg=tile_deg):
-                try:
-                    yield json.dumps(feat) + '\n'
-                except Exception as e:
-                    yield json.dumps({'_error': str(e)}) + '\n'
+             for feat in stream_overpass_tiles(mlat, mlon, xlat, xlon, tag_filters=tag_filters, tile_deg=tile_deg):
+                 try:
+                     yield json.dumps(feat) + '\n'
+                 except Exception as e:
+                     yield json.dumps({'_error': str(e)}) + '\n'
         yield json.dumps({'_meta':{'status':'done'}}) + '\n'
-
+ 
     return Response(generate(), mimetype='application/x-ndjson')
 
 
@@ -456,6 +456,13 @@ def get_country_boundaries(simplify_tol=0.1):
             # return an empty FeatureCollection instead of None so client receives a 200 and can continue
             return {'type': 'FeatureCollection', 'features': []}
 
+    # Debug: report how many raw features we loaded
+    try:
+        total_raw = len(gj.get('features', []))
+    except Exception:
+        total_raw = 0
+    app.logger.debug("Loaded countries geojson: raw_features=%d, simplify_tol=%s, local_file=%s", total_raw, simplify_tol, local_file)
+
     # Try to use Shapely for assembling/simplifying boundaries; if not available,
     # fall back to extracting polygon exteriors directly from the GeoJSON.
     features = []
@@ -470,6 +477,7 @@ def get_country_boundaries(simplify_tol=0.1):
         props = feat.get('properties', {}) or {}
         geom_json = feat.get('geometry')
         if not geom_json:
+            app.logger.debug("Skipping country with no geometry: %s", props.get('ADMIN') or props.get('NAME') or props.get('name'))
             continue
 
         if shapely_available:
@@ -479,6 +487,7 @@ def get_country_boundaries(simplify_tol=0.1):
                     geom = geom.simplify(simplify_tol, preserve_topology=True)
                 boundary = geom.boundary
                 if boundary.is_empty:
+                    app.logger.debug("Boundary empty after simplify for: %s (skipping)", props.get('ADMIN') or props.get('NAME') or props.get('name'))
                     continue
                 if boundary.geom_type == 'LineString':
                     coords = [[float(x), float(y)] for x, y in boundary.coords]
@@ -522,6 +531,8 @@ def get_country_boundaries(simplify_tol=0.1):
                 # other geometries: ignore
                 continue
 
+    # Debug: how many output boundary features produced
+    app.logger.debug("get_country_boundaries: produced %d boundary features (from %d raw features)", len(features), total_raw)
     return {'type': 'FeatureCollection', 'features': features}
 
 
@@ -599,10 +610,18 @@ def api_countries_stream():
     except Exception:
         shapely_ok = False
 
-    target_box = None
-    if shapely_ok:
-        target_box = box(minlon, minlat, maxlon, maxlat)
+    # Normalize and split incoming bbox (handles wrapping / antimeridian)
+    queried_bboxes = normalize_and_split_bbox(minlat, minlon, maxlat, maxlon)
+    if not queried_bboxes:
+        return jsonify({"error": "Invalid bbox after normalization/clamping"}), 400
+    app.logger.debug("api_countries_stream original bbox: %s normalized/split -> %s", [minlat, minlon, maxlat, maxlon], queried_bboxes)
 
+    # Build shapely boxes for each split bbox (if shapely available)
+    target_boxes = []
+    if shapely_ok:
+        for (a, b, c, d) in queried_bboxes:
+            target_boxes.append(box(b, a, d, c))   # box(minx(minlon), miny(minlat), maxx(maxlon), maxy(maxlat))
+ 
     def gen():
         count = 0
         for feat in countries.get('features', []):
@@ -613,22 +632,24 @@ def api_countries_stream():
             try:
                 if shapely_ok:
                     gshape = shape(geom)
-                    if not gshape.intersects(target_box):
+                    # if it doesn't intersect any of the split target boxes, skip
+                    intersects_any = any(gshape.intersects(tb) for tb in target_boxes)
+                    if not intersects_any:
                         continue
-                    # compute centroid and priority (area) for label placement and collision
+                     # compute centroid and priority (area) for label placement and collision
                     try:
-                        cent = gshape.representative_point().coords[0]
-                        c_lon, c_lat = float(cent[0]), float(cent[1])
+                         cent = gshape.representative_point().coords[0]
+                         c_lon, c_lat = float(cent[0]), float(cent[1])
                     except Exception:
-                        try:
-                            c = gshape.centroid
-                            c_lon, c_lat = float(c.x), float(c.y)
-                        except Exception:
-                            c_lon, c_lat = None, None
+                         try:
+                             c = gshape.centroid
+                             c_lon, c_lat = float(c.x), float(c.y)
+                         except Exception:
+                             c_lon, c_lat = None, None
                     try:
-                        priority = float(abs(gshape.area))
+                         priority = float(abs(gshape.area))
                     except Exception:
-                        priority = 0.0
+                         priority = 0.0
                     # If intersects, yield the feature (keep properties) and add centroid/priority
                     out_props = dict(props)
                     if c_lon is not None and c_lat is not None:
@@ -638,24 +659,30 @@ def api_countries_stream():
                     yield json.dumps(out) + "\n"
                     count += 1
                 else:
-                    # fallback: simple coordinate check - if any coordinate falls inside bbox, include
+                    # fallback: simple coordinate check - if any coordinate falls inside any split bbox, include
                     included = False
                     gtype = geom.get('type')
                     coords = geom.get('coordinates')
                     if not coords:
                         continue
-                    def any_in_ring(ring):
+                    def any_in_ring_for_bbox(ring, bbox):
+                        a, b, c, d = bbox  # minlat, minlon, maxlat, maxlon
                         for lon, lat in ring:
-                            if minlat <= lat <= maxlat and minlon <= lon <= maxlon:
+                            if a <= lat <= c and b <= lon <= d:
                                 return True
                         return False
                     if gtype == 'LineString':
-                        if any_in_ring(coords):
-                            included = True
+                        for qbox in queried_bboxes:
+                            if any_in_ring_for_bbox(coords, qbox):
+                                included = True
+                                break
                     elif gtype == 'MultiLineString':
                         for part in coords:
-                            if any_in_ring(part):
-                                included = True
+                            for qbox in queried_bboxes:
+                                if any_in_ring_for_bbox(part, qbox):
+                                    included = True
+                                    break
+                            if included:
                                 break
                     if not included:
                         continue
