@@ -218,10 +218,9 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
     params.set('radius', String(radius));
   }
 
-  // include observer (controls.target) so server can perform hemisphere/backface culling
+  // include observer (sub-satellite point computed from camera) so server can perform hemisphere/backface culling
   try {
-    const center = controls.target.clone();
-    const centerLatLon = vector3ToLatLon(center);
+    const centerLatLon = getSubSatelliteLatLon();
     if (centerLatLon && typeof centerLatLon.lat === 'number') {
       params.set('observer_lat', String(centerLatLon.lat));
       params.set('observer_lon', String(centerLatLon.lon));
@@ -535,10 +534,9 @@ async function fetchOverpass(lat, lon, radiusMeters) {
       await fetchOverpassStream(lat, lon, radiusMeters, 25000);
     } else {
       const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
-      // attach observer center so server can cull far-side features
+      // attach observer center (sub-satellite point computed from camera) so server can cull far-side features
       try {
-        const center = controls.target.clone();
-        const centerLatLon = vector3ToLatLon(center);
+        const centerLatLon = getSubSatelliteLatLon();
         if (centerLatLon && typeof centerLatLon.lat === 'number') {
           qs.set('observer_lat', String(centerLatLon.lat));
           qs.set('observer_lon', String(centerLatLon.lon));
@@ -775,6 +773,33 @@ function vector3ToLatLon(v) {
   return { lat, lon };
 }
 
+// compute the sub-satellite point (latitude/longitude) from the current camera
+// by intersecting the camera ray with the globe. Falls back to controls.target
+// if there's no intersection (e.g. camera inside the globe).
+function getSubSatelliteLatLon() {
+  try {
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    const o = camera.position.clone();
+    const d = dir.clone().normalize();
+    const R = (modelScaledRadius || RADIUS);
+    const od = o.dot(d);
+    const oo = o.dot(o);
+    const disc = od * od - (oo - R * R);
+    if (disc < 0) {
+      // no intersection; fall back to controls.target
+      const center = controls.target.clone();
+      return vector3ToLatLon(center);
+    }
+    // smallest positive t
+    const t = -od - Math.sqrt(disc);
+    const point = o.add(d.multiplyScalar(t));
+    return vector3ToLatLon(point);
+  } catch (e) {
+    try { return vector3ToLatLon(controls.target.clone()); } catch (er) { return null; }
+  }
+}
+
 // map camera distance to Overpass search radius (meters)
 function cameraDistanceToRadius(distance) {
   // distance roughly scales with model radius (modelScaledRadius==1)
@@ -814,9 +839,16 @@ function shouldFetch(newLat, newLon, newRadius) {
 function scheduleFetchForControls() {
   if (fetchScheduled) clearTimeout(fetchScheduled);
   fetchScheduled = setTimeout(() => {
-    const target = controls.target.clone();
-    const { lat, lon } = vector3ToLatLon(target);
-    const dist = camera.position.distanceTo(target);
+    const sub = getSubSatelliteLatLon();
+    const { lat, lon } = sub || { lat: null, lon: null };
+    // build a target vector for distance/radius calculation
+    let targetVec = null;
+    if (lat !== null && lon !== null) {
+      targetVec = latLonToVector3(lat, lon, modelScaledRadius || RADIUS);
+    } else {
+      targetVec = controls.target.clone();
+    }
+    const dist = camera.position.distanceTo(targetVec);
     const radius = cameraDistanceToRadius(dist);
     if (shouldFetch(lat, lon, radius)) {
       lastFetch = { lat, lon, radius };
