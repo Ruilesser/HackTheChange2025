@@ -1914,7 +1914,7 @@ async function loadOsmFeaturesAt(lat, lon, radius = 500) {
 
 function addIconMarker(lat, lon, imageUrl, elevation) {
   // Use the same coordinate system as your globe (radius = 1)
-  const radius = (modelScaledRadius || RADIUS) + 0.02; // Slightly above surface + elevation offset
+  const radius = (modelScaledRadius || RADIUS) + 0.001; // Slightly above surface + elevation offset
 
   const offsetLat = lat + (Math.random() * 0.01 - 0.005); // ±0.005 degrees
   const offsetLon = lon + (Math.random() * 0.01 - 0.005); // ±0.005 degrees
