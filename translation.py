@@ -2,6 +2,23 @@ import math
 import requests
 import json
 
+def get_osm_json(lat, lon, radius=500):
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    query = f"""
+    [out:json];
+    (
+      node(around:{radius},{lat},{lon});
+      way(around:{radius},{lat},{lon});
+      relation(around:{radius},{lat},{lon});
+    );
+    out body;
+    >;
+    out skel qt;
+    """
+    response = requests.get(overpass_url, params={'data': query})
+    response.raise_for_status()
+    return response.json()
+
 def lonLatToMeters(lon, lat):
     RADIUS = 6378137.0  # Earth's radius in meters (WGS84)
     x = lon * RADIUS * math.pi / 180.0
