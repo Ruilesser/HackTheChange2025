@@ -4,6 +4,27 @@ import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/cont
 
 const container = document.getElementById('map-container');
 
+// lightweight FPS / timing panel
+const fpsCounter = document.createElement('div');
+fpsCounter.id = 'fps-counter';
+fpsCounter.style.position = 'absolute';
+fpsCounter.style.left = '8px';
+fpsCounter.style.top = '8px';
+fpsCounter.style.padding = '6px 8px';
+fpsCounter.style.background = 'rgba(11,16,32,0.8)';
+fpsCounter.style.color = '#fff';
+fpsCounter.style.font = '12px monospace';
+fpsCounter.style.zIndex = 9999;
+fpsCounter.style.pointerEvents = 'none';
+fpsCounter.innerHTML = '';
+container.appendChild(fpsCounter);
+
+// frame timing history (ms)
+const FRAME_HISTORY = 60;
+const frameTimes = [];
+let lastFrameTime = performance.now();
+let smoothedFps = 0;
+
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b1020);
 
@@ -742,10 +763,29 @@ onWindowResize();
 // animation loop
 function animate() {
   requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.max(0.001, now - lastFrameTime); // ms
+  lastFrameTime = now;
+  const instFps = 1000.0 / dt;
+  // exponential smoothing for FPS display
+  smoothedFps = smoothedFps * 0.93 + instFps * 0.07;
+  // update frameTimes buffer
+  frameTimes.push(dt);
+  if (frameTimes.length > FRAME_HISTORY) frameTimes.shift();
+
   controls.update();
   renderer.render(scene, camera);
   // update labels after render to ensure camera/projection are current
   updateLabelSprites();
+
+  // compute ms stats
+  let avg = 0, min = Infinity, max = 0;
+  for (const t of frameTimes) { avg += t; if (t < min) min = t; if (t > max) max = t; }
+  const n = frameTimes.length || 1;
+  avg = avg / n;
+  if (min === Infinity) min = 0;
+  // update UI
+  fpsCounter.innerHTML = `FPS: ${smoothedFps.toFixed(1)} &nbsp;|&nbsp; frame: ${dt.toFixed(1)} ms<br>avg: ${avg.toFixed(1)} ms (min ${min.toFixed(1)} / max ${max.toFixed(1)})`;
 }
 
 animate();
