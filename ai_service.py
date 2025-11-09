@@ -25,17 +25,17 @@ class AsyncModelAdapter:
         raise NotImplementedError
 
 # ----- Example adapters (stubs) -----
-class OllamaAdapter(AsyncModelAdapter):
-    def __init__(self, endpoint: str, concurrency: int = 1):
-        self.endpoint = endpoint
-        self.semaphore = asyncio.Semaphore(concurrency)
-        # If using a synchronous client, wrap it with run_in_executor
+# class OllamaAdapter(AsyncModelAdapter):
+#     def __init__(self, endpoint: str, concurrency: int = 1):
+#         self.endpoint = endpoint
+#         self.semaphore = asyncio.Semaphore(concurrency)
+#         # If using a synchronous client, wrap it with run_in_executor
 
-    async def generate(self, prompt: str, timeout: Optional[float] = None, **kwargs) -> str:
-        async with self.semaphore:
-            await asyncio.sleep(0.01)  # simulate I/O latency
-            # Replace with real HTTP/CLI call to Ollama here
-            return f"[ollama] response to: {prompt}"
+#     async def generate(self, prompt: str, timeout: Optional[float] = None, **kwargs) -> str:
+#         async with self.semaphore:
+#             await asyncio.sleep(0.01)  # simulate I/O latency
+#             # Replace with real HTTP/CLI call to Ollama here
+#             return f"[ollama] response to: {prompt}"
 
 class GeminiAdapter(AsyncModelAdapter):
     def __init__(self, api_key: str, concurrency: int = 2):
@@ -44,9 +44,22 @@ class GeminiAdapter(AsyncModelAdapter):
 
     async def generate(self, prompt: str, timeout: Optional[float] = None, **kwargs) -> str:
         async with self.semaphore:
+            
             await asyncio.sleep(0.02)  # simulate I/O
-            # Replace with real Gemini call
+
+            from google import genai
+
+            client = genai.Client()
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents="Within this radius",
+            )
+
+            print(response.text)
+        
             return f"[gemini] response to: {prompt}"
+        
 
 class LocalProcessAdapter(AsyncModelAdapter):
     def __init__(self, cmd: str, concurrency: int = 1):
