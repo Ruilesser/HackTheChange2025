@@ -78,10 +78,13 @@ scene.add(dir);
 const RADIUS = 1;
 let globe = null;
 let modelScaledRadius = RADIUS;
+// how far to push labels out from the globe surface to avoid z-fighting/clipping
+const LABEL_OFFSET = 0.03;
 {
   const sphereGeo = new THREE.SphereGeometry(RADIUS, 64, 64);
   const mat = new THREE.MeshStandardMaterial({ color: 0x2266aa, roughness: 1 });
   globe = new THREE.Mesh(sphereGeo, mat);
+  globe.renderOrder = 0;
   scene.add(globe);
 }
 
@@ -400,8 +403,9 @@ function createLabelSprite(text) {
   const texture = new THREE.CanvasTexture(canvas);
   texture.minFilter = THREE.LinearFilter;
   // enable depthTest so labels can be occluded by nearer geometry (the globe)
-  // but avoid writing to the depth buffer so labels don't block other objects
-  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true, depthWrite: false });
+  // avoid writing to the depth buffer so labels don't block other objects
+  // use alphaTest to discard fully transparent pixels and avoid halo/clipping
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true, depthWrite: false, alphaTest: 0.04 });
   const sprite = new THREE.Sprite(mat);
   // store pixel size for collision heuristics
   sprite.userData.screenSize = { w: canvas.width, h: canvas.height };
@@ -444,12 +448,14 @@ function addCountryLabelSprite(name, lat, lon, priority = 0) {
   }
 
   const sprite = createLabelSprite(name);
-  const worldPos = latLonToVector3(lat, lon, (modelScaledRadius || RADIUS) + 0.01);
+  const worldPos = latLonToVector3(lat, lon, (modelScaledRadius || RADIUS) + LABEL_OFFSET);
   sprite.position.copy(worldPos);
   sprite.userData.worldPos = worldPos.clone();
   sprite.userData.priority = typeof priority === 'number' ? priority : 0;
   // initial scale -- will be adjusted each frame to keep consistent pixel size
   sprite.scale.set(0.4, 0.14, 1);
+  // ensure labels render after globe so depth buffering reflects globe geometry
+  sprite.renderOrder = 2;
   scene.add(sprite);
   spriteLabels.push(sprite);
   spriteLabelIndex.set(key, sprite);
