@@ -915,6 +915,34 @@ async function processElement(element, iconMap) {
 // -----------------------------------------------------------
 // Main entry point
 // -----------------------------------------------------------
+async function getOsmJson(lat, lon, radius = 500) {
+    // radius = 500 is the default, can be overwritten by passing a different value
+    const overpassUrl = "https://overpass-api.de/api/interpreter";
+    const query = `
+        [out:json];
+        (
+          node(around:${radius},${lat},${lon});
+          way(around:${radius},${lat},${lon});
+          relation(around:${radius},${lat},${lon});
+        );
+        out body;
+        >;
+        out skel qt;
+    `;
+
+    const response = await fetch(overpassUrl, {
+        method: "POST", // Overpass API expects POST for queries
+        body: query
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    return await response.json();
+}
+
+
 async function processOsmJson(jsonString) {
     /**
      * Process a full OSM JSON string.
