@@ -144,11 +144,13 @@ def process_element(element, icon_map):
     }
 
     icon = get_icon_for_element(element, icon_map)
+    xy = lonLatToMeters(lon, lat)
 
     return {
         'id': element['id'],
         'points': element['points'],
         'centroid': {'lat': lat, 'lon': lon},
+        'xy': xy, # this is the coordinates to use on the map
         'base_elev': base_elev,
         **height_info,
         'tags': element['tags'],
