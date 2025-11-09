@@ -206,7 +206,7 @@ async def main_demo():
     #     # "local": LocalProcessAdapter(cmd="./local_model", concurrency=1),
     # }
 
-    svc = AIService(GeminiAdapter(api_key="AIzaSyBQ7eKuefURDF7CA7mhT4Oe_ntu2ruLiMk", concurrency=2), worker_count=6)
+    svc = AIService(GeminiAdapter(api_key="", concurrency=2), worker_count=6)
     await svc.start()
 
     async def make_query(prompt, model):

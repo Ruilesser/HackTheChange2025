@@ -3,8 +3,14 @@ import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
 import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
+// Load environment variables at the VERY TOP of your file
+require('dotenv').config();
+
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+
 class AIService {
-  constructor(apiKey) {
+  constructor() {
+    const apiKey = process.env.GEMINI_API_KEY;
     this.genAI = new GoogleGenerativeAI(apiKey);
     this.model = this.genAI.getGenerativeModel({ model: "gemini-pro" });
   }
@@ -771,6 +777,8 @@ document.getElementById('locate-me').addEventListener('click', () => {
     alert('Geolocation not supported by your browser');
     return;
   }
+  let result;
+
   navigator.geolocation.getCurrentPosition((pos) => {
     const lat = pos.coords.latitude;
     const lon = pos.coords.longitude;
@@ -783,9 +791,10 @@ document.getElementById('locate-me').addEventListener('click', () => {
     const radius = cameraDistanceToRadius(dist);
     fetchOverpass(lat, lon, radius);
     clearStatus();
+    result = getOsmJson(lat, lon, radius);
 
     // THIS CODE HERE is for adding icons onto the map
-    getOsmJson(lat, lon, radius)
+    result
       .then(osmData => processOsmJson(JSON.stringify(osmData)))
       .then(processedElements => {
         for (const el of processedElements) {
@@ -812,10 +821,10 @@ document.getElementById('locate-me').addEventListener('click', () => {
 
   // Usage
   async function makeQuery() {
-    const svc = new AIService("your-api-key-here");
+    const svc = new AIService();
 
     try {
-      const resp = await svc.submit("Your analysis prompt here");
+      const resp = await svc.submit(result);
       console.log("GOT:", resp);
       return resp; // This is your Gemini response
     } catch (error) {
