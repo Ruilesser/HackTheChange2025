@@ -628,6 +628,7 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
+  let featureCount = 0;
   // prepare frustum/camera direction for local culling
   const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
   const frustum = new THREE.Frustum();
