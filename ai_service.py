@@ -4,7 +4,13 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Callable, Coroutine
+import google.generativeai as genai
 
+genai.configure(api_key="AIzaSyBQ7eKuefURDF7CA7mhT4Oe_ntu2ruLiMk")
+
+model = genai.GenerativeModel("gemini-pro")
+response = model.generate_content("Your prompt here")
+print(response.text)
 # ----- Task / Request object -----
 @dataclass
 class AIRequest:
