@@ -9,35 +9,51 @@ def lonLatToMeters(lon, lat):
     return {"x": x, "y": y}
 
 def get_elevation(lat, lon):
-    # This uses USGS 90m resolution horizontally, works for this projects accuracy
+    #Get elevation (m) for given coordinates using OpenTopoData SRTM90m
     url = f"https://api.opentopodata.org/v1/srtm90m?locations={lat},{lon}"
     r = requests.get(url)
     data = r.json()
     if 'results' in data and len(data['results']) > 0:
-        return data['results'][0]['elevation']
+        return data['results'][0].get('elevation', 0.0)
     return 0.0
 
+
+# Height parsing ------------------------------------------------
+# Building heights
 def parse_height(tags):
-    """Parse height from OSM tags."""
-    height = tags.get("height")
-    if height:
+    """Parse building height and min_height if available."""
+    def safe_float(value):
         try:
-            return float(height.lower().replace("m", "").strip()) # in case JSON inconsistent with m
-        except ValueError:
-            pass
+            return float(value.lower().replace("m", "").strip())
+        except Exception:
+            return None
 
-    levels = tags.get("building:levels")
-    if levels:
-        try:
-            return float(levels) * 3  # assume 3 m per floor
-        except ValueError:
-            pass
+    height = safe_float(tags.get("height", ""))
+    min_height = safe_float(tags.get("min_height", tags.get("building:min_height", "")))
+    levels = safe_float(tags.get("building:levels", ""))
+    min_levels = safe_float(tags.get("building:min_level", ""))
 
-    return 10.0  # default height for buildings (such as houses not having heights)
+    # height if missing
+    if height is None and levels is not None:
+        height = levels * 3.0
+    if min_height is None and min_levels is not None:
+        min_height = min_levels * 3.0
 
+    # Fallbacks - check for heights
+    if height is None:
+        height = 10.0 if "building" in tags else 0.0
+    if min_height is None:
+        min_height = 0.0
 
-# --- Extraction + Processing ----------------------------------------
+    return {
+        "height": height,
+        "min_height": min_height,
+        "effective_height": max(0.0, height - min_height)
+    }
 
+# -----------------------------------------------------------
+# OSM extraction
+# -----------------------------------------------------------
 def extract_elements(osm_json):
     """
     Extract all 'way' elements from full JSON
@@ -46,68 +62,68 @@ def extract_elements(osm_json):
     
     Returns a list of dicts like:
         { 'points': [...], 'tags': {...}, 'type': 'way' }
-    You can later filter by tag (e.g. 'building', 'highway', etc.)
+    You can filter by tag (e.g. 'building', 'highway')
     """
     elements = osm_json.get('elements', [])
     nodes = {n['id']: n for n in elements if n['type'] == 'node'}
 
     extracted = []
-
-    for x in elements:
-        if x['type'] == 'way':
-            points = []
-            for node_id in x['nodes']:
-                node = nodes.get(node_id)
-                if node:
-                    points.append({'lat': node['lat'], 'lon': node['lon']})
+    for el in elements:
+        if el['type'] == 'way':
+            points = [
+                {'lat': nodes[nid]['lat'], 'lon': nodes[nid]['lon']}
+                for nid in el.get('nodes', [])
+                if nid in nodes
+            ]
             if points:
                 extracted.append({
                     'points': points,
-                    'tags': x.get('tags', {}),
-                    'id': x.get('id'),
-                    'type': x['type']
+                    'tags': el.get('tags', {}),
+                    'id': el.get('id'),
+                    'type': el['type']
                 })
     return extracted
 
-# condition for is building because we want height
 def is_building(element):
-    """Check if the OSM element represents a building."""
-    tags = element.get('tags', {})
-    return 'building' in tags
+    #True if element is a building (has 'building' tag)
+    return 'building' in element.get('tags', {})
 
-def process_building(building):
-    """Compute centroid, base elevation, and height for one building."""
-    lat = sum(p['lat'] for p in building['points']) / len(building['points'])
-    lon = sum(p['lon'] for p in building['points']) / len(building['points'])
+# -----------------------------------------------------------
+# Processing functions
+# -----------------------------------------------------------
+def process_element(element):
+    """Compute center, elevation, and height (if any)."""
+    lat = sum(p['lat'] for p in element['points']) / len(element['points'])
+    lon = sum(p['lon'] for p in element['points']) / len(element['points'])
     base_elev = get_elevation(lat, lon)
-    height = parse_height(building['tags'])
-    return {
-        'points': building['points'],
-        'base_elev': base_elev,
-        'height': height,
-        'tags': building['tags']
+
+    height_info = parse_height(element['tags']) if is_building(element) else {
+        "height": 0.0,
+        "min_height": 0.0,
+        "effective_height": 0.0
     }
 
+    return {
+        'id': element['id'],
+        'points': element['points'],
+        'centroid': {'lat': lat, 'lon': lon},
+        'base_elev': base_elev,
+        **height_info,
+        'tags': element['tags']
+    }
 
-# CALL THIS THIS IS THE ONE YOU WANT
+# -----------------------------------------------------------
+# Main entry point
+# -----------------------------------------------------------
 def process_osm_json(json_string):
     """
-    Process a full Overpass JSON string:
-    - Extracts all elements (ways)
-    - Processes buildings (adds elevation + height)
-    - Returns both building data and other features with coordinates
+    Process a full OSM JSON string.
+    Returns a unified list of all elements, each with:
+      - id, points, centroid, base_elev
+      - height/min_height/effective_height (if any)
+      - tags
     """
     osm_data = json.loads(json_string)
     all_elements = extract_elements(osm_data)
-
-    # Buildings (with height/elevation info)
-    buildings = [el for el in all_elements if is_building(el)]
-    processed_buildings = [process_building(b) for b in buildings]
-
-    # Non-building features (roads, parks, etc.)
-    other_features = [el for el in all_elements if not is_building(el)]
-
-    return {
-        "buildings": processed_buildings,
-        "other_features": other_features  # still contains coords + tags
-    }
+    processed = [process_element(el) for el in all_elements]
+    return processed
