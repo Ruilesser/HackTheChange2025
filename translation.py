@@ -164,7 +164,7 @@ def process_osm_json(json_string):
     """
     Process a full OSM JSON string.
     Returns a unified list of all elements, each with:
-      - id, points, center, base_elev
+      - id, points, center, xy, base_elev
       - height/min_height/effective_height (if any)
       - tags
     """
