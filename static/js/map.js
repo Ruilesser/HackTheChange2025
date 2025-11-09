@@ -877,10 +877,11 @@ animate();
 // bbox format: minlat,minlon,maxlat,maxlon
 fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 0.2 });
 
-/* TEST ICONS WORK, uncomment this if you want to see test values
+///* TEST ICONS WORK, uncomment this if you want to see test values
 setTimeout(() => {
     testIconPlacement();
-}, 2000); */
+}, 2000); 
+//*/
 
 // -----------------------------------------------------------
 // Utilities
@@ -940,31 +941,52 @@ function parseHeight(tags) {
 // -----------------------------------------------------------
 // OSM extraction
 // -----------------------------------------------------------
+// -----------------------------------------------------------
+// OSM extraction - IMPROVED VERSION
+// -----------------------------------------------------------
 function extractElements(osmJson) {
     /**
-     * Extract all 'way' elements from full JSON
+     * Extract all 'way' and 'node' elements from full JSON
      * node coordinates into lat/lon points.
      * Returns a list of objects like:
      * { points: [...], tags: {...}, type: 'way' }
      * You can filter by tag (e.g. 'building', 'highway')
      */
     const elements = osmJson.elements || [];
-    const nodes = Object.fromEntries(elements.filter(n => n.type === "node").map(n => [n.id, n]));
+    const nodes = Object.fromEntries(
+        elements.filter(n => n.type === "node")
+                .map(n => [n.id, {lat: n.lat, lon: n.lon, tags: n.tags || {}}])
+    );
 
     const extracted = [];
+    
     for (const el of elements) {
-        if (el.type === "way") {
-            const points = el.nodes?.map(nid => nodes[nid] && ({ lat: nodes[nid].lat, lon: nodes[nid].lon })).filter(Boolean);
-            if (points?.length) {
+        if (el.type === "node") {
+            // Handle standalone nodes with tags
+            if (el.tags && Object.keys(el.tags).length > 0) {
+                extracted.push({
+                    points: [{ lat: el.lat, lon: el.lon }],
+                    tags: el.tags,
+                    id: el.id,
+                    type: el.type
+                });
+            }
+        } 
+        else if (el.type === "way") {
+            const points = el.nodes?.map(nid => nodes[nid]).filter(Boolean);
+            if (points?.length && el.tags) {
                 extracted.push({
                     points,
-                    tags: el.tags ?? {},
+                    tags: el.tags || {},
                     id: el.id,
                     type: el.type
                 });
             }
         }
+        // Note: relations are more complex and may need special handling
     }
+    
+    console.log(`Extracted ${extracted.length} elements (${elements.length} total in OSM data)`);
     return extracted;
 }
 
@@ -977,7 +999,7 @@ function isBuilding(element) {
 // Processing functions
 // -----------------------------------------------------------
 function getIconForElement(element, iconMap) {
-    /**
+  /**
      * Assign an icon based on tags:
      * - Recreational amenities get generic recreational icon
      * - Other amenities use value-specific icons if available, otherwise default
@@ -986,73 +1008,117 @@ function getIconForElement(element, iconMap) {
      * - Other keys use default per key or global fallback
      */
     const tags = element.tags || {};
-
-    for (const [key, value] of Object.entries(tags)) {
-        // --- Amenity ---
-        if (key === "amenity") {
-            const recreationList = [
-                "bar", "bbq", "brothel", "cafe", "cinema", "food_court",
-                "marketplace", "nightclub", "restaurant", "swinger_club",
-                "theatre", "vending_machine"
-            ];
-            if (recreationList.includes(value)) return iconMap.amenity[value] ?? iconMap.amenity._default;
-            return iconMap.amenity[value] ?? iconMap.amenity._default;
-        }
-
-        // --- Emergency ---
-        if (key === "emergency") return iconMap.emergency[value] ?? iconMap.emergency._default;
-
-        // --- Natural ---
-        if (key === "natural") return iconMap.natural._default;
-
-        // --- Other keys ---
-        if (key in iconMap) return iconMap[key]._default ?? iconMap._global_default._default;
+    
+    // Debug: log the tags we're processing
+    if (Object.keys(tags).length > 0) {
+        console.log('Processing element tags:', tags);
     }
-
-    // --- Global fallback ---
+    
+    // Check each tag in priority order
+    if (tags.amenity) {
+        const amenityValue = tags.amenity;
+        if (iconMap.amenity && iconMap.amenity[amenityValue]) {
+            return iconMap.amenity[amenityValue];
+        }
+        return iconMap.amenity._default;
+    }
+    
+    if (tags.building) {
+        return iconMap.building._default;
+    }
+    
+    if (tags.shop) {
+        return iconMap.shop._default;
+    }
+    
+    if (tags.emergency) {
+        const emergencyValue = tags.emergency;
+        if (iconMap.emergency && iconMap.emergency[emergencyValue]) {
+            return iconMap.emergency[emergencyValue];
+        }
+        return iconMap.emergency._default;
+    }
+    
+    if (tags.natural) {
+        return iconMap.natural._default;
+    }
+    
+    // Check other known tag categories
+    const knownCategories = ['tourism', 'leisure', 'office', 'historic', 'man_made'];
+    for (const category of knownCategories) {
+        if (tags[category]) {
+            return iconMap[category]?._default || iconMap._global_default._default;
+        }
+    }
+    
+    // Global fallback
     return iconMap._global_default._default;
 }
 
 async function processElement(element, iconMap) {
-    /** Compute center, elevation, and height (if any). */
-    const lat = element.points.reduce((acc, p) => acc + p.lat, 0) / element.points.length;
-    const lon = element.points.reduce((acc, p) => acc + p.lon, 0) / element.points.length;
-    const baseElev = await getElevation(lat, lon);
-
-    const heightInfo = isBuilding(element) ? parseHeight(element.tags) : {
-        height: 0.0,
-        min_height: 0.0,
-        effective_height: 0.0 // USE THIS
-    };
-
-    const icon = getIconForElement(element, iconMap);
-    const xy = lonLatToMeters(lon, lat);
-
-    return {
-        id: element.id,
-        points: element.points,
-        centroid: { lat, lon },
-        xy, // this is the coordinates to use on the map
-        base_elev: baseElev,
-        ...heightInfo,
-        tags: element.tags,
-        icon
-    };
-}
-        // Abortable fetch helper with timeout (ms)
-        async function abortableFetch(input, init = {}, timeoutMs = 20000) {
-          const controller = new AbortController();
-          const signal = controller.signal;
-          const id = setTimeout(() => controller.abort(), timeoutMs);
-          try {
-            const res = await fetch(input, Object.assign({}, init, { signal }));
-            clearTimeout(id);
-            return res;
-          } catch (err) {
-            clearTimeout(id);
-            throw err;
-          }
+    /**
+     * Process a full OSM JSON string.
+     * Returns a unified list of all elements, each with:
+     * - id, points, center, xy, base_elev
+     * - height/min_height/effective_height (if any)
+     * - tags
+     */
+    try {
+        // Calculate centroid
+        const lat = element.points.reduce((acc, p) => acc + p.lat, 0) / element.points.length;
+        const lon = element.points.reduce((acc, p) => acc + p.lon, 0) / element.points.length;
+        
+        // Get elevation with error handling
+        let baseElev = 0.0;
+        try {
+            baseElev = await getElevation(lat, lon);
+        } catch (elevErr) {
+            console.warn(`Elevation API failed for (${lat}, ${lon}):`, elevErr);
+            baseElev = 0.0;
         }
+        
+        const heightInfo = isBuilding(element) ? parseHeight(element.tags) : {
+            height: 0.0,
+            min_height: 0.0,
+            effective_height: 0.0
+        };
+
+        const icon = getIconForElement(element, iconMap);
+        const xy = lonLatToMeters(lon, lat);
+
+        return {
+            id: element.id,
+            points: element.points,
+            centroid: { lat, lon },
+            xy,
+            base_elev: baseElev,
+            ...heightInfo,
+            tags: element.tags,
+            icon,
+            type: element.type
+        };
+    } catch (error) {
+        console.error('Error processing element:', element.id, error);
+        return null;
+    }
+}
+
+// -----------------------------------------------------------
+// Abortable fetch helper with timeout (ms)
+// -----------------------------------------------------------
+async function abortableFetch(input, init = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(input, Object.assign({}, init, { signal }));
+    clearTimeout(id);
+    return res;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
+}
 
 // Test function to verify icons are working
 function testIconPlacement() {
@@ -1122,13 +1188,35 @@ async function processOsmJson(jsonString) {
      * - height/min_height/effective_height (if any)
      * - tags
      */
-    const osmData = JSON.parse(jsonString);
-    const allElements = extractElements(osmData);
-    const processed = [];
-    for (const el of allElements) {
-        processed.push(await processElement(el, ICON_MAP));
+    try {
+        const osmData = JSON.parse(jsonString);
+        console.log('OSM Data structure:', {
+            elementsCount: osmData.elements?.length || 0,
+            elementTypes: [...new Set(osmData.elements?.map(el => el.type) || [])]
+        });
+        
+        const allElements = extractElements(osmData);
+        console.log('Filtered elements by tags:', allElements.length);
+        
+        // Log some sample elements to see what we're working with
+        if (allElements.length > 0) {
+            console.log('Sample elements:', allElements.slice(0, 3));
+        }
+        
+        const processed = [];
+        for (const el of allElements) {
+            const result = await processElement(el, ICON_MAP);
+            if (result) {
+                processed.push(result);
+            }
+        }
+        
+        console.log(`Successfully processed ${processed.length} elements`);
+        return processed;
+    } catch (error) {
+        console.error('Error processing OSM JSON:', error);
+        throw error;
     }
-    return processed;
 }
 
 // -----------------------------------------------------------
@@ -1172,6 +1260,7 @@ function addIconMarker(lat, lon, imageUrl, elevation) {
   textureLoader.load(
     imageUrl,
     (texture) => {
+      console.log('SUCCESS: Icon texture loaded: ', imageUrl);
       const material = new THREE.SpriteMaterial({ 
         map: texture, 
         transparent: true,
