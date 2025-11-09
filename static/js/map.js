@@ -59,12 +59,16 @@ const POLYGON_SIMPLIFICATION_ENABLED = false;
 
 // OSM / elevation controls
 let lastOsmElementsCount = 0; // number of elements in last OSM payload
+let lastIconRequestTime = 0;
+let currentOverpassController = null;
+let currentIconRequestController = null;
+const MIN_ICON_REQUEST_INTERVAL = 2000; // 2 seconds between icon requests
 //const ELEVATION_ENABLED = true; // set false to disable elevation lookups entirely
 //const ELEVATION_BATCH_THRESHOLD = 5000; // skip per-element elevation if payload larger than this
 // maximum radius (meters) for fetching detailed OSM icons — prevents huge requests
-const ICON_OSM_RADIUS_MAX = 1000;
+const ICON_OSM_RADIUS_MAX = 300;
 const OVERPASS_MAX_RADIUS = 2000;
-const OVERPASS_SPLIT_THRESHOLD = 2000;
+const OVERPASS_SPLIT_THRESHOLD = 800; // Lower threshold to split earlier
 
 // debug overlay updater (throttled)
 let lastDebugUpdate = 0;
@@ -218,6 +222,12 @@ function makeOverpassCacheKey(lat, lon, radius) {
   const lonKey = (Math.round(lon * 20) / 20).toFixed(3);
   const rKey = Math.round(radius / 200) * 200; // 200m buckets
   return `${latKey}:${lonKey}:${rKey}`;
+}
+
+// Clear the Overpass cache to force fresh requests
+function clearOverpassCache() {
+  overpassCache.clear();
+  console.log('Overpass cache cleared');
 }
 
 function scheduleOverpassFetch(lat, lon, radius) {
@@ -773,112 +783,109 @@ function simplifyCoords(coords, maxPoints) {
   if (out[out.length - 1] !== coords[n - 1]) out.push(coords[n - 1]);
   return out;
 }
-
-async function fetchOverpass(lat, lon, radiusMeters) {
-  if (radiusMeters > OVERPASS_SPLIT_THRESHOLD) {
-    console.log('Large radius detected, switching to streaming with splitting:', radiusMeters);
-    await fetchOverpassStream(lat, lon, radiusMeters, 25000);
+// Preventive splitting function for large areas
+// Preventive splitting function for large areas - FIXED VERSION
+async function fetchSplitOverpassQueries(lat, lon, radiusMeters, recursionDepth = 0) {
+  const MAX_RECURSION_DEPTH = 3;
+  
+  // Base case: stop recursion if we've gone too deep or radius is small enough
+  if (recursionDepth >= MAX_RECURSION_DEPTH || radiusMeters <= 1000) {
+    console.log(`Base case reached: depth=${recursionDepth}, radius=${radiusMeters}`);
+    await fetchOverpassStream(lat, lon, radiusMeters, recursionDepth);
     return;
   }
 
-  setStatus('Preparing OSM request — computing radius and method...', 'loading', 8000);
-  const cacheKey = makeOverpassCacheKey(lat, lon, radiusMeters);
-  // use streaming endpoint for larger radii to avoid large single responses
-  const useStream = radiusMeters > 3000;
-  try {
-    if (useStream) {
-      // stream with a generous timeout; abort if server is unresponsive
-      await fetchOverpassStream(lat, lon, radiusMeters, 25000);
-    } else {
-      const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
-      // attach observer center (sub-satellite point computed from camera) so server can cull far-side features
-      try {
-        if (observerCullingEnabled) {
-          const centerLatLon = getSubSatelliteLatLon();
-          if (centerLatLon && typeof centerLatLon.lat === 'number') {
-            qs.set('observer_lat', String(centerLatLon.lat));
-            qs.set('observer_lon', String(centerLatLon.lon));
-          }
-        }
-      } catch (e) {}
-      setStatus('Requesting Overpass (synchronous) — waiting for server...', 'loading', 15000);
-      // abort if server doesn't respond in time
-      const res = await abortableFetch(`/api/overpass?${qs.toString()}`, { method: 'GET' }, 25000);
-      if (!res.ok) {
-        // handle rate-limit specially
-        if (res.status === 429 || res.status === 504) {
-          overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
-          // remove cache so we can retry later
-          try { overpassCache.delete(cacheKey); } catch (e) {}
-          setStatus('Overpass rate limit reached — pausing requests for 60s', 'error', 8000);
-          return;
-        }
-        const txt = await res.text();
-        // on other errors, remove cache so we don't falsely suppress retries
-        try { overpassCache.delete(cacheKey); } catch (e) {}
-        throw new Error('Overpass API request failed: ' + txt);
-      }
-      const geojson = await res.json();
-      // prepare frustum / camera direction for client-side culling
-      const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
-      const frustum = new THREE.Frustum();
-      const projScreenMatrix = new THREE.Matrix4();
-      projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-      frustum.setFromProjectionMatrix(projScreenMatrix);
-
-      clearFeatures();
-      for (const feat of geojson.features || []) {
-        const geom = feat.geometry;
-        if (!geom) continue;
-        // determine representative lat/lon
-        let repLat = null, repLon = null;
-        if (feat.properties && feat.properties.centroid && feat.properties.centroid.length >= 2) {
-          repLon = parseFloat(feat.properties.centroid[0]);
-          repLat = parseFloat(feat.properties.centroid[1]);
-        } else {
-          const rep = geometryRepresentativeLatLon(geom);
-          if (rep) { repLat = rep.lat; repLon = rep.lon; }
-        }
-        if (repLat !== null && repLon !== null) {
-          const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
-          const toPoint = worldPos.clone().sub(camera.position).normalize();
-          if (observerCullingEnabled) {
-            if (toPoint.dot(camDir) <= 0) continue; // behind globe
-            if (!frustum.containsPoint(worldPos)) continue; // outside view
-          }
-        }
-        if (geom.type === 'Point') {
-          const [lon, lat] = geom.coordinates;
-          renderPoint(lat, lon, 0xff5533, 0.02);
-        } else if (geom.type === 'LineString') {
-          renderLine(geom.coordinates, 0x00ff88);
-        } else if (geom.type === 'Polygon') {
-          renderPolygon(geom.coordinates, 0x009988);
-        }
-      }
+  // Calculate split parameters
+  const radiusDeg = radiusMeters / 111320;
+  const splitRadius = radiusMeters / 3;
+  
+  console.log(`Splitting ${radiusMeters}m area (depth ${recursionDepth}) into 4 parts of ${splitRadius}m each`);
+  
+  const splits = [
+    { latOffset: -0.15, lonOffset: -0.15, name: 'SW' },
+    { latOffset: -0.15, lonOffset: 0.15, name: 'SE' },  
+    { latOffset: 0.15, lonOffset: -0.15, name: 'NW' },
+    { latOffset: 0.15, lonOffset: 0.15, name: 'NE' }
+  ];
+  
+  let successfulSplits = 0;
+  let failedSplits = 0;
+  
+  for (let i = 0; i < splits.length; i++) {
+    const split = splits[i];
+    const splitLat = lat + (split.latOffset * radiusDeg);
+    const splitLon = lon + (split.lonOffset * radiusDeg);
+    
+    console.log(`Fetching split ${split.name} at (${splitLat.toFixed(6)}, ${splitLon.toFixed(6)}) with radius ${splitRadius}m`);
+    setStatus(`Loading area part ${i + 1}/4...`, 'loading', 3000);
+    
+    // Add delay between requests
+    if (i > 0) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
-  } catch (err) {
-    console.error('Failed to fetch/parse Overpass data', err);
-    try { overpassCache.delete(cacheKey); } catch (e) {}
-    alert('Failed to load Overpass data: ' + err.message);
-  } finally {
-    clearStatus();
+    
+    try {
+      // Recursive call with increased depth counter
+      await fetchSplitOverpassQueries(splitLat, splitLon, splitRadius, recursionDepth + 1);
+      successfulSplits++;
+      console.log(`✓ Split ${split.name} completed successfully`);
+    } catch (err) {
+      console.warn(`✗ Split query ${split.name} failed:`, err);
+      failedSplits++;
+    }
+  }
+  
+  console.log(`Preventive splitting completed: ${successfulSplits}/4 splits successful, ${failedSplits} failed`);
+  if (successfulSplits > 0) {
+    setStatus(`Loaded ${successfulSplits} area parts successfully`, 'info', 4000);
+  } else if (failedSplits > 0) {
+    setStatus('Failed to load area parts - try zooming in closer', 'error', 5000);
   }
 }
 
-async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
-  if (radiusMeters > OVERPASS_SPLIT_THRESHOLD) {
-    console.log('Preventive splitting for large radius:', radiusMeters);
+// Modified fetchOverpassStream with recursion depth parameter
+async function fetchOverpassStream(lat, lon, radiusMeters, recursionDepth = 0, timeoutMs = 25000) {
+  const MAX_RECURSION_DEPTH = 3;
+  
+  // Only split if we haven't recursed too deep AND radius is still too large
+  if (radiusMeters > OVERPASS_SPLIT_THRESHOLD && recursionDepth < MAX_RECURSION_DEPTH) {
+    console.log(`Splitting large radius: ${radiusMeters}m (depth ${recursionDepth})`);
     setStatus('Splitting large area into smaller queries...', 'loading', 5000);
-    await fetchSplitOverpassQueries(lat, lon, radiusMeters);
-    return; // Stop the original large query
+    try {
+      await fetchSplitOverpassQueries(lat, lon, radiusMeters, recursionDepth);
+      return; // Stop the original large query
+    } catch (err) {
+      console.error('Split Overpass queries failed:', err);
+      setStatus('Failed to load area - try zooming in', 'error', 5000);
+      return;
+    }
+  }
+  
+  // If we're at max recursion depth but radius is still large, warn and proceed cautiously
+  if (radiusMeters > OVERPASS_SPLIT_THRESHOLD && recursionDepth >= MAX_RECURSION_DEPTH) {
+    console.warn(`Max recursion depth reached with large radius: ${radiusMeters}m`);
+    setStatus('Area very large - loading with reduced detail', 'warning', 4000);
+    // Continue with the request but we know it might fail
   }
 
+  // Cancel any ongoing request
+  if (currentOverpassController) {
+    currentOverpassController.abort();
+    console.log('Cancelled previous Overpass request');
+  }
+  
+  currentOverpassController = new AbortController();
+  
   clearFeatures();
-  // remember cache key so we can remove it if the stream fails due to rate-limiting
   const cacheKey = makeOverpassCacheKey(lat, lon, radiusMeters);
-  const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
-  // attach observer center so server can cull far-side features
+  
+  const qs = new URLSearchParams({ 
+    lat: String(lat), 
+    lon: String(lon), 
+    radius: String(radiusMeters) 
+  });
+  
+  // attach observer center for server-side culling
   try {
     if (observerCullingEnabled) {
       const centerLatLon = getSubSatelliteLatLon();
@@ -888,66 +895,104 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
       }
     }
   } catch (e) {}
+  
   let res;
   try {
     setStatus('Requesting Overpass stream — waiting for server...', 'loading', null);
-    res = await abortableFetch(`/api/overpass_stream?${qs.toString()}`, { method: 'GET' }, timeoutMs);
+    res = await abortableFetch(`/api/overpass_stream?${qs.toString()}`, { 
+      method: 'GET',
+      signal: currentOverpassController.signal
+    }, timeoutMs);
   } catch (err) {
     if (err.name === 'AbortError') {
+      console.log('Overpass stream request cancelled during fetch');
+      setStatus('Overpass stream cancelled', 'info', 3000);
+      return;
+    }
+    if (err.message && err.message.includes('abort')) {
       setStatus('Overpass stream timed out (server did not respond)', 'error', 8000);
       return;
     }
     setStatus('Overpass stream request failed', 'error', 8000);
     throw err;
   }
+  
   if (!res.ok) {
     const txt = await res.text();
     setStatus('Overpass stream request failed (server error)', 'error', 8000);
+    
     // handle 429 specially
     if (res.status === 429) {
       overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
-      // remove cache entry so we don't permanently suppress retries for this area
       try { overpassCache.delete(cacheKey); } catch (e) {}
       setStatus('Overpass rate limit reached — pausing requests for 60s', 'error', 8000);
       return;
     }
     throw new Error('Overpass stream failed: ' + txt);
   }
+  
+  // ... rest of the stream processing code remains the same ...
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
   let featureCount = 0;
-  // prepare frustum/camera direction for local culling
-  const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
+  
+  // Client-side culling preparation
+  const camDir = new THREE.Vector3(); 
+  camera.getWorldDirection(camDir);
   const frustum = new THREE.Frustum();
   const projScreenMatrix = new THREE.Matrix4();
   projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(projScreenMatrix);
+  
   // helper to read with idle timeout
   async function readChunkWithTimeout(ms) {
     const readPromise = reader.read();
     const timeoutPromise = new Promise((_, rej) => setTimeout(() => rej(new Error('stream-read-timeout')), ms));
     return Promise.race([readPromise, timeoutPromise]);
   }
-  // Run the stream processing inside try/catch so any unexpected exception cancels the reader
+  
   try {
     while (true) {
+      // Check for cancellation
+      if (currentOverpassController.signal.aborted) {
+        console.log('Overpass stream cancelled during processing');
+        await reader.cancel();
+        return;
+      }
+      
       let done, value;
       try {
         const r = await readChunkWithTimeout(OVERPASS_STREAM_IDLE_MS);
         ({ done, value } = r);
       } catch (e) {
-        // idle timeout or other read error — cancel and abort stream processing
+        if (currentOverpassController.signal.aborted) {
+          console.log('Overpass stream cancelled during chunk read');
+          await reader.cancel();
+          return;
+        }
+        // idle timeout or other read error
         console.warn('Overpass stream read idle or error, cancelling:', e && e.message);
         setStatus('No data from Overpass stream — aborting', 'error', 6000);
+        await reader.cancel();
         return;
       }
+      
       if (done) break;
+      
       buf += decoder.decode(value, { stream: true });
       let lines = buf.split('\n');
       buf = lines.pop();
+      
       for (const line of lines) {
+        if (currentOverpassController.signal.aborted) {
+          console.log('Overpass stream cancelled during line processing');
+          await reader.cancel();
+          return;
+        }
+        
         if (!line.trim()) continue;
+        
         let obj;
         try {
           obj = JSON.parse(line);
@@ -955,34 +1000,45 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
           console.warn('Failed to parse NDJSON line', e, line);
           continue;
         }
+        
+        // Handle errors and metadata
         if (obj._error) {
           console.warn('Overpass tile error', obj);
-          // If server reports Overpass rate limiting (429) or gateway timeout (504) for a tile, pause further Overpass queries
+          
+          if (obj._error.includes('tile') || obj._error.includes('full') || obj._error.includes('too large')) {
+            console.warn('Tile map full error detected, clearing cache and suggesting smaller area');
+            overpassCache.clear();
+            setStatus('Area too dense — try zooming in for more detail', 'error', 6000);
+            await reader.cancel();
+            return;
+          }
+          
+          // Handle rate limiting
           try {
             const details = String(obj.details || '').toLowerCase();
             if (details.includes('429') || details.includes('too many requests') || details.includes('504') || details.includes('gateway')) {
               overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
-              // remove cache entry so we can retry after cooldown rather than being blocked
               try { overpassCache.delete(cacheKey); } catch (e) {}
-              setStatus('Overpass rate limit or server timeout reached (tile requests) — pausing for 60s', 'error', 8000);
-              return; // stop processing the stream
+              setStatus('Overpass rate limit or server timeout reached — pausing for 60s', 'error', 8000);
+              await reader.cancel();
+              return;
             }
-          } catch (e) {
-            // ignore parsing errors
-          }
+          } catch (e) {}
           continue;
         }
+        
         if (obj._meta) {
-          // progress or done marker - the server may emit summaries here
           if (obj._meta && obj._meta.message) {
             setStatus(obj._meta.message, 'loading', null);
           }
           continue;
         }
-        // treat as GeoJSON Feature
+        
+        // Process GeoJSON feature
         const geom = obj.geometry;
         if (!geom) continue;
-        // lightweight client-side culling: find rep lat/lon and test frustum/backface
+        
+        // Apply client-side culling
         let repLat = null, repLon = null;
         if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
           repLon = parseFloat(obj.properties.centroid[0]);
@@ -991,15 +1047,17 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
           const rep = geometryRepresentativeLatLon(geom);
           if (rep) { repLat = rep.lat; repLon = rep.lon; }
         }
+        
         if (repLat !== null && repLon !== null) {
           const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.005);
           const toPoint = worldPos.clone().sub(camera.position).normalize();
-          // Only apply these visibility checks when observer culling is enabled.
           if (observerCullingEnabled) {
             if (toPoint.dot(camDir) <= 0) continue;
             if (!frustum.containsPoint(worldPos)) continue;
           }
         }
+        
+        // Render feature
         if (geom.type === 'Point') {
           const [lon, lat] = geom.coordinates;
           renderPoint(lat, lon, 0xff5533, 0.02);
@@ -1011,20 +1069,27 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
           renderPolygon(geom.coordinates, 0x009988);
           featureCount++;
         }
-        // update status occasionally to show progress
+        
+        // Update progress
         if (featureCount > 0 && featureCount % 200 === 0) {
           setStatus(`Streaming OSM features… ${featureCount} features received`, 'loading', null);
         }
       }
     }
   } catch (streamErr) {
-    console.error('Error processing Overpass stream:', streamErr);
-    setStatus('Error processing Overpass stream', 'error', 6000);
+    if (streamErr.name !== 'AbortError') {
+      console.error('Error processing Overpass stream:', streamErr);
+      setStatus('Error processing Overpass stream', 'error', 6000);
+    }
   } finally {
-    // ensure reader is released
-    try { await reader.cancel(); } catch (e) { /* ignore */ }
+    try { 
+      await reader.cancel(); 
+    } catch (e) { 
+      /* ignore cancellation errors */ 
+    }
   }
-  // parse final buffer
+  
+  // Parse final buffer
   if (buf.trim()) {
     try {
       const obj = JSON.parse(buf.trim());
@@ -1043,77 +1108,180 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
       console.warn('final NDJSON parse failed', e, buf);
     }
   }
+  
   setStatus(`Done — streamed ${featureCount} features`, 'info', 6000);
+  currentOverpassController = null;
 }
 
-// Preventive splitting function for large areas
-async function fetchSplitOverpassQueries(lat, lon, radiusMeters) {
-  const splits = [
-    { latOffset: -0.25, lonOffset: -0.25, name: 'SW' }, // South-West
-    { latOffset: -0.25, lonOffset: 0.25, name: 'SE' },  // South-East  
-    { latOffset: 0.25, lonOffset: -0.25, name: 'NW' },  // North-West
-    { latOffset: 0.25, lonOffset: 0.25, name: 'NE' }    // North-East
-  ];
+// Also update the regular fetchOverpass function to use the same pattern
+async function fetchOverpass(lat, lon, radiusMeters) {
+  // Cancel any ongoing request
+  if (currentOverpassController) {
+    currentOverpassController.abort();
+    console.log('Cancelled previous Overpass request');
+  }
   
-  // Convert radius to approximate degrees (rough approximation: 1 degree ≈ 111km)
-  const radiusDeg = radiusMeters / 111320;
-  const splitRadius = radiusMeters / 2; // Each split gets half the radius
+  currentOverpassController = new AbortController();
   
-  console.log(`Splitting ${radiusMeters}m area into 4 parts of ${splitRadius}m each`);
-  
-  let successfulSplits = 0;
-  
-  for (let i = 0; i < splits.length; i++) {
-    const split = splits[i];
-    const splitLat = lat + (split.latOffset * radiusDeg);
-    const splitLon = lon + (split.lonOffset * radiusDeg);
-    
-    console.log(`Fetching split ${split.name} at (${splitLat.toFixed(6)}, ${splitLon.toFixed(6)})`);
-    setStatus(`Loading area part ${i + 1}/4...`, 'loading', 3000);
-    
-    // Add delay between requests to avoid overwhelming the server
-    if (i > 0) {
-      await new Promise(resolve => setTimeout(resolve, 1500)); // 1.5 second delay
-    }
-    
+  // Check for large radius and split if needed
+  if (radiusMeters > OVERPASS_SPLIT_THRESHOLD) {
+    console.log('Preventive splitting for large radius:', radiusMeters);
+    setStatus('Splitting large area into smaller queries...', 'loading', 5000);
     try {
-      // Use the existing fetchOverpassStream function for each split
-      await fetchOverpassStream(splitLat, splitLon, splitRadius);
-      successfulSplits++;
-      console.log(`✓ Split ${split.name} completed successfully`);
+      await fetchSplitOverpassQueries(lat, lon, radiusMeters, 0);
+      return; // Stop the original large query
     } catch (err) {
-      console.warn(`✗ Split query ${split.name} failed:`, err);
+      console.error('Split Overpass queries failed:', err);
+      setStatus('Failed to load area - try zooming in', 'error', 5000);
     }
+    return;
   }
+
+  // ... rest of the original fetchOverpass implementation ...
+  setStatus('Preparing OSM request — computing radius and method...', 'loading', 8000);
+  const cacheKey = makeOverpassCacheKey(lat, lon, radiusMeters);
   
-  console.log(`Preventive splitting completed: ${successfulSplits}/4 splits successful`);
-  if (successfulSplits > 0) {
-    setStatus(`Loaded ${successfulSplits} area parts successfully`, 'info', 4000);
-  } else {
-    setStatus('Failed to load area parts - try zooming in closer', 'error', 5000);
+  try {
+    const qs = new URLSearchParams({ 
+      lat: String(lat), 
+      lon: String(lon), 
+      radius: String(radiusMeters) 
+    });
+    
+    // attach observer center for server-side culling
+    try {
+      if (observerCullingEnabled) {
+        const centerLatLon = getSubSatelliteLatLon();
+        if (centerLatLon && typeof centerLatLon.lat === 'number') {
+          qs.set('observer_lat', String(centerLatLon.lat));
+          qs.set('observer_lon', String(centerLatLon.lon));
+        }
+      }
+    } catch (e) {}
+    
+    setStatus('Requesting Overpass (synchronous) — waiting for server...', 'loading', 15000);
+    
+    const res = await abortableFetch(`/api/overpass?${qs.toString()}`, { 
+      method: 'GET',
+      signal: currentOverpassController.signal 
+    }, 25000);
+    
+    if (!res.ok) {
+      // handle rate-limit specially
+      if (res.status === 429 || res.status === 504) {
+        overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+        try { overpassCache.delete(cacheKey); } catch (e) {}
+        setStatus('Overpass rate limit reached — pausing requests for 60s', 'error', 8000);
+        return;
+      }
+      const txt = await res.text();
+      try { overpassCache.delete(cacheKey); } catch (e) {}
+      throw new Error('Overpass API request failed: ' + txt);
+    }
+    
+    const geojson = await res.json();
+    
+    // Client-side culling preparation
+    const camDir = new THREE.Vector3(); 
+    camera.getWorldDirection(camDir);
+    const frustum = new THREE.Frustum();
+    const projScreenMatrix = new THREE.Matrix4();
+    projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(projScreenMatrix);
+
+    clearFeatures();
+    
+    // Process features with culling
+    for (const feat of geojson.features || []) {
+      const geom = feat.geometry;
+      if (!geom) continue;
+      
+      // determine representative lat/lon for culling
+      let repLat = null, repLon = null;
+      if (feat.properties && feat.properties.centroid && feat.properties.centroid.length >= 2) {
+        repLon = parseFloat(feat.properties.centroid[0]);
+        repLat = parseFloat(feat.properties.centroid[1]);
+      } else {
+        const rep = geometryRepresentativeLatLon(geom);
+        if (rep) { repLat = rep.lat; repLon = rep.lon; }
+      }
+      
+      // Apply culling if enabled
+      if (repLat !== null && repLon !== null) {
+        const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
+        const toPoint = worldPos.clone().sub(camera.position).normalize();
+        if (observerCullingEnabled) {
+          if (toPoint.dot(camDir) <= 0) continue; // behind globe
+          if (!frustum.containsPoint(worldPos)) continue; // outside view
+        }
+      }
+      
+      // Render based on geometry type
+      if (geom.type === 'Point') {
+        const [lon, lat] = geom.coordinates;
+        renderPoint(lat, lon, 0xff5533, 0.02);
+      } else if (geom.type === 'LineString') {
+        renderLine(geom.coordinates, 0x00ff88);
+      } else if (geom.type === 'Polygon') {
+        renderPolygon(geom.coordinates, 0x009988);
+      }
+    }
+    
+    setStatus(`Loaded ${geojson.features?.length || 0} OSM features`, 'info', 4000);
+    
+  } catch (err) {
+    // Don't log if it was a cancellation
+    if (err.name !== 'AbortError') {
+      console.error('Failed to fetch/parse Overpass data', err);
+      try { overpassCache.delete(cacheKey); } catch (e) {}
+      setStatus('Failed to load Overpass data: ' + err.message, 'error', 6000);
+    }
+  } finally {
+    currentOverpassController = null;
   }
 }
-
 
 // Geolocation: center on user's current position
+// Modify the locate-me handler to ensure icons load
 document.getElementById('locate-me').addEventListener('click', () => {
-  // show a friendly status while geolocation runs
   setStatus('Requesting device location…', 'loading', 10000);
   if (!navigator.geolocation) {
     setStatus('Geolocation not supported by your browser', 'error', 5000);
     alert('Geolocation not supported by your browser');
     return;
   }
+  
+  // Clear previous data and cache
+  clearAllFeatures();
+  clearOverpassCache();
+  clearIconMarkers();
+  
+  // Reset icon throttle for new location
+  lastIconRequestTime = 0;
+  lastIconLocationKey = null;
+  
+  // Cancel any ongoing requests
+  if (currentOverpassController) {
+    currentOverpassController.abort();
+    currentOverpassController = null;
+  }
+  
   navigator.geolocation.getCurrentPosition((pos) => {
     const lat = pos.coords.latitude;
     const lon = pos.coords.longitude;
-    // smooth fly-to the location, then request visible data (LOD/streaming/icons)
+    
     clearIconMarkers();
     flyToLatLon(lat, lon, 3.0, 900, () => {
-      try { requestVisibleData(lat, lon, { immediate: true }); } catch (e) { console.warn('locate-me: requestVisibleData failed', e); }
+      try { 
+        // Force icon loading by passing immediate option
+        requestVisibleData(lat, lon, { 
+          immediate: true, 
+          customRadius: 1000,
+          forceIcons: true  // Add this flag
+        });
+      } catch (e) { console.warn('locate-me: requestVisibleData failed', e); }
     });
     clearStatus();
-
   }, (err) => {
     clearStatus();
     setStatus('Failed to get device location', 'error', 6000);
@@ -1163,10 +1331,9 @@ function getSubSatelliteLatLon() {
 
 // map camera distance to Overpass search radius (meters)
 function cameraDistanceToRadius(distance) {
-  // distance roughly scales with model radius (modelScaledRadius==1)
-  // map distance in [1.5, 10] -> radius in meters [200, 10000]
+  // More conservative mapping to avoid large queries
   const minD = 1.5, maxD = 10;
-  const minR = 200, maxR = 10000;
+  const minR = 100, maxR = 800;  // Reduced from 2000 to 800
   const t = Math.min(1, Math.max(0, (distance - minD) / (maxD - minD)));
   // invert so smaller distance => smaller radius
   const v = 1 - t;
@@ -1221,7 +1388,7 @@ async function requestVisibleData(lat = null, lon = null, options = {}) {
   else targetVec = controls.target.clone();
 
   const dist = camera.position.distanceTo(targetVec);
-  const radius = cameraDistanceToRadius(dist);
+  const radius = options.customRadius || cameraDistanceToRadius(dist);
 
   // Overpass fetch for OSM features (throttled via scheduleOverpassFetch)
   try {
@@ -1244,9 +1411,15 @@ async function requestVisibleData(lat = null, lon = null, options = {}) {
     console.warn('requestVisibleData: country stream failed', e);
   }
 
-  // Icon loading: only when zoomed sufficiently (avoid huge Overpass responses)
+  // Icon loading: only when zoomed sufficiently OR forced
   try {
-    if (radius <= ICON_OSM_RADIUS_MAX) {
+    if (radius <= ICON_OSM_RADIUS_MAX || options.forceIcons) {
+      // Reset throttle when forcing icons
+      if (options.forceIcons) {
+        lastIconRequestTime = 0;
+        lastIconLocationKey = null;
+      }
+      
       // ensure existing icons are cleared (caller may already have cleared)
       clearIconMarkers();
       // load and place icons (this will add sprite markers)
@@ -1430,11 +1603,11 @@ try {
   fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 1.5 });
 }
 
-/* TEST ICONS WORK, uncomment this if you want to see test values
+///* TEST ICONS WORK, uncomment this if you want to see test values
 setTimeout(() => {
     testIconPlacementAtKnownLocations();
 }, 2000); 
-*/
+//*/
 
 // -----------------------------------------------------------
 // Utilities
@@ -1504,61 +1677,80 @@ function parseHeight(tags) {
      */
 function extractElements(osmJson) {
     const elements = osmJson.elements || [];
-    const nodes = Object.fromEntries(
-        elements.filter(n => n.type === "node")
-                .map(n => [n.id, {lat: n.lat, lon: n.lon, tags: n.tags || {}}])
-    );
-
     const extracted = [];
     
-    // Priority tags in order of importance
-    const priorityTags = ['amenity', 'shop', 'tourism', 'leisure', 'building', 'historic', 'railway', 'aeroway'];
+    // Priority categories (in order of importance)
+    const priorityCategories = [
+        // Emergency & Healthcare (highest priority)
+        { tags: ['amenity', 'emergency'], values: ['hospital', 'clinic', 'police', 'fire_station', 'ambulance_station', 'pharmacy'] },
+        
+        // Public Services & Government
+        { tags: ['amenity', 'office', 'building'], values: ['townhall', 'courthouse', 'library', 'post_office', 'government'] },
+        
+        // Education
+        { tags: ['amenity'], values: ['school', 'university', 'college', 'kindergarten'] },
+        
+        // Transportation
+        { tags: ['amenity', 'railway', 'aeroway', 'highway'], values: ['bus_station', 'station', 'terminal', 'bus_stop'] },
+        
+        // Utilities & Essential Services
+        { tags: ['amenity'], values: ['drinking_water', 'toilets', 'charging_station'] },
+        
+        // Commercial & Food
+        { tags: ['amenity', 'shop'], values: ['restaurant', 'cafe', 'supermarket', 'bank'] },
+        
+        // Tourism & Leisure
+        { tags: ['tourism', 'leisure'], values: ['hotel', 'museum', 'park', 'sports_centre'] },
+        
+        // Religious & Cultural
+        { tags: ['amenity', 'historic', 'building'], values: ['place_of_worship', 'monument', 'castle'] }
+    ];
     
-    // Values to EXCLUDE (unimportant features)
-    const excludeValues = {
-        amenity: ['bench', 'waste_basket', 'recycling', 'vending_machine', 'post_box', 'telephone'],
-        shop: ['kiosk', 'newsagent', 'tobacco', 'alcohol'],
-        tourism: ['information', 'artwork'],
-        leisure: ['picnic_table', 'bench', 'playground'],
-        highway: ['traffic_signals', 'street_lamp', 'crossing'] // Exclude all highway features
-    };
-    
+    // Only process nodes for icons
     for (const el of elements) {
-        if (el.type === "node") {
-            if (el.tags && Object.keys(el.tags).length > 0) {
-                const hasPriorityTag = priorityTags.some(tag => tag in el.tags);
-                if (hasPriorityTag) {
-                    // Check if we should exclude this element
-                    let shouldExclude = false;
-                    for (const [tagKey, tagValue] of Object.entries(el.tags)) {
-                        if (excludeValues[tagKey] && excludeValues[tagKey].includes(tagValue)) {
-                            shouldExclude = true;
-                            break;
-                        }
-                    }
-                    
-                    if (!shouldExclude) {
-                        extracted.push({
-                            points: [{ lat: el.lat, lon: el.lon }],
-                            tags: el.tags,
-                            id: el.id,
-                            type: el.type
-                        });
+        if (el.type === "node" && el.tags && Object.keys(el.tags).length > 0) {
+            // Check if this element matches any priority category
+            let isPriority = false;
+            let priorityScore = 0;
+            
+            for (let i = 0; i < priorityCategories.length; i++) {
+                const category = priorityCategories[i];
+                const categoryPriority = priorityCategories.length - i; // Higher score for more important categories
+                
+                for (const tag of category.tags) {
+                    if (el.tags[tag] && category.values.includes(el.tags[tag])) {
+                        isPriority = true;
+                        priorityScore = Math.max(priorityScore, categoryPriority);
+                        break;
                     }
                 }
+                if (isPriority) break;
             }
-        } 
-        // Skip ways for now to reduce complexity
+            
+            if (isPriority) {
+                extracted.push({
+                    points: [{ lat: el.lat, lon: el.lon }],
+                    tags: el.tags,
+                    id: el.id,
+                    type: el.type,
+                    priority: priorityScore
+                });
+            }
+        }
     }
     
-    console.log(`Extracted ${extracted.length} priority elements (${elements.length} total in OSM data)`);
+    // Sort by priority (highest first)
+    extracted.sort((a, b) => (b.priority || 0) - (a.priority || 0));
     
-    // Sort by priority (amenity first, then shop, etc.)
-    extracted.sort((a, b) => {
-        const aPriority = priorityTags.findIndex(tag => tag in a.tags);
-        const bPriority = priorityTags.findIndex(tag => tag in b.tags);
-        return aPriority - bPriority;
-    });
+    console.log(`Extracted ${extracted.length} priority elements for icons`);
+    
+    // Log some examples for debugging
+    if (extracted.length > 0) {
+        console.log('Top priority elements:', extracted.slice(0, 5).map(el => ({
+            tags: el.tags,
+            priority: el.priority
+        })));
+    }
     
     return extracted;
 }
@@ -1776,9 +1968,22 @@ function testIconPlacement() {
 }
 
 // Alternative test function that uses specific known locations
+// Alternative test function that uses specific known locations
 function testIconPlacementAtKnownLocations() {
-  // Clear existing icons
+  // Clear existing data more thoroughly
+  clearAllFeatures();
+  clearOverpassCache();
   clearIconMarkers();
+  
+  // Reset icon throttle
+  lastIconRequestTime = 0;
+  lastIconLocationKey = null;
+  
+  // Cancel any ongoing requests
+  if (currentOverpassController) {
+    currentOverpassController.abort();
+    currentOverpassController = null;
+  }
   
   // Test at multiple known locations with urban areas
   const testLocations = [
@@ -1791,26 +1996,32 @@ function testIconPlacementAtKnownLocations() {
   console.log('Testing icon placement at multiple known locations');
   setStatus('Loading OSM icons at test locations...', 'loading', 8000);
   
-  // Load icons for each test location
+  // Load icons for each test location with delays
   let completed = 0;
-  testLocations.forEach(location => {
-    loadOsmFeaturesAt(location.lat, location.lon, location.radius)
-      .then(() => {
-        completed++;
-        console.log(`Completed loading icons for ${location.name}`);
-        
-        if (completed === testLocations.length) {
-          setStatus(`Test completed - loaded OSM icons at ${testLocations.length} locations`, 'info', 5000);
-        }
-      })
-      .catch(err => {
-        completed++;
-        console.error(`Failed to load icons for ${location.name}:`, err);
-        
-        if (completed === testLocations.length) {
-          setStatus(`Test completed with some errors - check console`, 'error', 5000);
-        }
-      });
+  testLocations.forEach((location, index) => {
+    setTimeout(() => {
+      // Reset throttle for each new location
+      lastIconRequestTime = 0;
+      lastIconLocationKey = null;
+      
+      loadOsmFeaturesAt(location.lat, location.lon, location.radius)
+        .then(() => {
+          completed++;
+          console.log(`Completed loading icons for ${location.name}`);
+          
+          if (completed === testLocations.length) {
+            setStatus(`Test completed - loaded OSM icons at ${testLocations.length} locations`, 'info', 5000);
+          }
+        })
+        .catch(err => {
+          completed++;
+          console.error(`Failed to load icons for ${location.name}:`, err);
+          
+          if (completed === testLocations.length) {
+            setStatus(`Test completed with some errors - check console`, 'error', 5000);
+          }
+        });
+    }, index * 5000); // 5 second delay between requests to ensure throttle doesn't block
   });
 }
 
@@ -1820,7 +2031,7 @@ function testIconPlacementAtKnownLocations() {
 // -----------------------------------------------------------
 // Main entry point
 // -----------------------------------------------------------
-async function getOsmJson(lat, lon, radius = 500) {
+async function getOsmJson(lat, lon, radius = 300) {
     try {
         if (inOverpassCooldown()) {
             throw new Error('Overpass cooldown active');
@@ -1828,26 +2039,58 @@ async function getOsmJson(lat, lon, radius = 500) {
         
         const overpassUrl = "https://overpass-api.de/api/interpreter";
         
-        // SIMPLIFIED AND CORRECTED QUERY
+        // COMPREHENSIVE OPTIMIZED QUERY - All important civic infrastructure
         const query = `
-[out:json][timeout:25];
+[out:json][timeout:15];
 (
-  // Key amenities
-  node(around:${radius},${lat},${lon})[amenity];
-  node(around:${radius},${lat},${lon})[shop];
-  node(around:${radius},${lat},${lon})[tourism];
-  node(around:${radius},${lat},${lon})[leisure];
-  node(around:${radius},${lat},${lon})[building];
-  node(around:${radius},${lat},${lon})[historic];
-  node(around:${radius},${lat},${lon})[railway=station];
-  node(around:${radius},${lat},${lon})[aeroway=terminal];
+  // Healthcare facilities
+  node(around:${radius},${lat},${lon})[amenity~"^(hospital|clinic|doctors|dentist|pharmacy|health_centre|social_facility)$"];
+  
+  // Emergency services
+  node(around:${radius},${lat},${lon})[amenity~"^(police|fire_station|ambulance_station|fire_hydrant)$"];
+  node(around:${radius},${lat},${lon})[emergency~"^(ambulance_station|fire_station|police|lifeguard_station|first_aid|defibrillator)$"];
+  
+  // Public buildings & government
+  node(around:${radius},${lat},${lon})[amenity~"^(townhall|courthouse|public_building|library|post_office|post_box|prison)$"];
+  node(around:${radius},${lat},${lon})[building~"^(townhall|civic|public|government|courthouse)$"];
+  node(around:${radius},${lat},${lon})[office~"^(government|administrative)$"];
+  
+  // Education
+  node(around:${radius},${lat},${lon})[amenity~"^(school|university|college|kindergarten|childcare)$"];
+  
+  // Religious buildings
+  node(around:${radius},${lat},${lon})[amenity~"^(place_of_worship)$"];
+  node(around:${radius},${lat},${lon})[building~"^(church|cathedral|mosque|temple|synagogue|shrine)$"];
+  
+  // Transportation hubs
+  node(around:${radius},${lat},${lon})[amenity~"^(bus_station|taxi|ferry_terminal|bicycle_rental|car_rental)$"];
+  node(around:${radius},${lat},${lon})[railway~"^(station|halt|tram_stop)$"];
+  node(around:${radius},${lat},${lon})[aeroway~"^(terminal|gate)$"];
+  node(around:${radius},${lat},${lon})[highway~"^(bus_stop)$"];
+  
+  // Utilities & public services
+  node(around:${radius},${lat},${lon})[amenity~"^(drinking_water|water_point|toilets|recycling|shelter|charging_station)$"];
+  
+  // Commercial & food
+  node(around:${radius},${lat},${lon})[amenity~"^(restaurant|cafe|bar|pub|fast_food|food_court|marketplace|cinema|theatre|nightclub)$"];
+  node(around:${radius},${lat},${lon})[shop~"^(supermarket|convenience|mall|department_store|bakery|butcher|greengrocer)$"];
+  
+  // Tourism & leisure
+  node(around:${radius},${lat},${lon})[tourism~"^(hotel|hostel|motel|museum|attraction|viewpoint|information)$"];
+  node(around:${radius},${lat},${lon})[leisure~"^(park|sports_centre|stadium|golf_course|swimming_pool|fitness_centre)$"];
+  
+  // Historic & cultural
+  node(around:${radius},${lat},${lon})[historic~"^(castle|monument|memorial|archaeological_site|ruins)$"];
+  
+  // Financial
+  node(around:${radius},${lat},${lon})[amenity~"^(bank|atm|bureau_de_change)$"];
 );
 out body;
 >;
 out skel qt;
 `;
 
-        console.log('Fetching SIMPLIFIED OSM data for icons...');
+        console.log('Fetching COMPREHENSIVE OSM data for icons...');
         const response = await fetch(overpassUrl, {
             method: "POST",
             headers: {
@@ -1866,10 +2109,10 @@ out skel qt;
         }
         
         const data = await response.json();
-        console.log('SIMPLIFIED OSM data received:', data.elements?.length || 0, 'elements');
+        console.log('COMPREHENSIVE OSM data received:', data.elements?.length || 0, 'elements');
         return data;
     } catch (err) {
-        console.error('Failed to fetch simplified OSM data:', err);
+        console.error('Failed to fetch comprehensive OSM data:', err);
         throw err;
     }
 }
@@ -1932,27 +2175,71 @@ async function processOsmJson(jsonString) {
 // -----------------------------------------------------------
 // ICON_MAP
 // -----------------------------------------------------------
-async function loadOsmFeaturesAt(lat, lon, radius = 500) {
-  try {
-    // Fetch OSM data near the clicked location
-    const osmJson = await getOsmJson(lat, lon, radius);
-    const jsonString = JSON.stringify(osmJson);
-
-    // Process it into usable structures
-    const elements = await processOsmJson(jsonString);
-
-    // Add markers for each
-    for (const el of elements) {
-      if (el.icon && el.centroid) {
-        addIconMarker(el.centroid.lat, el.centroid.lon, el.icon, 0.08);
-      }
+// Modify the loadOsmFeaturesAt function to reset the timer when location changes
+async function loadOsmFeaturesAt(lat, lon, radius = 300) {
+    // Only throttle if it's the SAME location, not when location changes
+    const locationKey = `${lat.toFixed(6)},${lon.toFixed(6)}`;
+    const now = Date.now();
+    
+    // Reset the timer if we're at a new location
+    if (locationKey !== lastIconLocationKey) {
+        lastIconRequestTime = 0; // Reset throttle for new location
+        lastIconLocationKey = locationKey;
     }
+    
+    if (now - lastIconRequestTime < MIN_ICON_REQUEST_INTERVAL) {
+        console.log('Skipping icon request - too frequent for same location');
+        return;
+    }
+    lastIconRequestTime = now;
+    
+    try {
+        // Clear previous icons first
+        clearIconMarkers();
+        
+        setStatus('Loading important locations...', 'loading', 3000);
+        
+        const osmJson = await getOsmJson(lat, lon, radius);
+        const elements = await processOsmJson(JSON.stringify(osmJson));
 
-    console.log(`Placed ${elements.length} OSM icons near (${lat}, ${lon})`);
-  } catch (err) {
-    console.error("Failed to load OSM features:", err);
-  }
+        // Use priority to determine which icons to show
+        const maxIcons = 40; // Reasonable limit
+        const iconsToShow = elements
+            .sort((a, b) => (b.priority || 0) - (a.priority || 0))
+            .slice(0, maxIcons);
+        
+        let placedCount = 0;
+        for (const el of iconsToShow) {
+            if (el.icon && el.centroid) {
+                addIconMarker(el.centroid.lat, el.centroid.lon, el.icon, 0.08);
+                placedCount++;
+            }
+        }
+
+        console.log(`Placed ${placedCount} priority OSM icons near (${lat}, ${lon})`);
+        
+        // Show summary of what was found
+        const categories = {};
+        iconsToShow.forEach(el => {
+            const mainTag = Object.keys(el.tags || {})[0];
+            if (mainTag) {
+                categories[mainTag] = (categories[mainTag] || 0) + 1;
+            }
+        });
+        
+        const categorySummary = Object.entries(categories)
+            .map(([tag, count]) => `${count} ${tag}`)
+            .join(', ');
+            
+        setStatus(`Found ${placedCount} important locations: ${categorySummary}`, 'info', 5000);
+        
+    } catch (err) {
+        console.error("Failed to load OSM features:", err);
+        setStatus('Failed to load important locations', 'error', 3000);
+    }
 }
+
+let lastIconLocationKey = null;
 
 
 function addIconMarker(lat, lon, imageUrl, elevation) {
