@@ -57,13 +57,8 @@ scene.add(featurePoints);
 scene.add(featureLines);
 scene.add(countryBorders);
 
-// DOM label container (overlay on top of renderer)
-const labelContainer = document.createElement('div');
-labelContainer.id = 'labels';
-container.appendChild(labelContainer);
-
-// store label objects { el, worldPos: THREE.Vector3 }
-const countryLabels = [];
+// Sprite-based labels (Three.js) for performance and consistent scaling
+const spriteLabels = []; // array of { sprite, worldPos: Vector3, priority }
 
 function clearFeatures() {
   featurePoints.clear();
@@ -192,9 +187,20 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       // collect label info and add label (country name)
       if (obj.properties && obj.properties.name) {
         try {
-          const rep = geometryRepresentativeLatLon(geom);
-          if (rep) {
-            addCountryLabel(obj.properties.name, rep.lat, rep.lon);
+          // server provides centroid (lon,lat) and label_priority when available
+          const props = obj.properties || {};
+          let latc = null, lonc = null, priority = props.label_priority || 0;
+          if (props.centroid && props.centroid.length >= 2) {
+            lonc = parseFloat(props.centroid[0]);
+            latc = parseFloat(props.centroid[1]);
+          } else {
+            const rep = geometryRepresentativeLatLon(geom);
+            if (rep) {
+              latc = rep.lat; lonc = rep.lon;
+            }
+          }
+          if (latc !== null && lonc !== null) {
+            addCountryLabelSprite(obj.properties.name, latc, lonc, priority);
           }
         } catch (e) {
           // ignore label errors
@@ -245,37 +251,101 @@ function geometryRepresentativeLatLon(geom) {
   }
   return null;
 }
-
-function addCountryLabel(name, lat, lon) {
-  const el = document.createElement('div');
-  el.className = 'country-label';
-  el.textContent = name;
-  labelContainer.appendChild(el);
-  const worldPos = latLonToVector3(lat, lon, (modelScaledRadius || RADIUS) + 0.01);
-  countryLabels.push({ el, worldPos });
+// create a sprite containing text for a label
+function createLabelSprite(text) {
+  const padding = 8;
+  const font = 'bold 28px sans-serif';
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.font = font;
+  const metrics = ctx.measureText(text);
+  const textWidth = Math.ceil(metrics.width);
+  const textHeight = 34; // approximate line height
+  canvas.width = textWidth + padding * 2;
+  canvas.height = textHeight + padding * 2;
+  // redraw with proper size
+  ctx.font = font;
+  ctx.fillStyle = 'rgba(11,16,32,0.9)';
+  roundRect(ctx, 0, 0, canvas.width, canvas.height, 6);
+  ctx.fillStyle = '#ffffff';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, padding, canvas.height / 2);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+  const sprite = new THREE.Sprite(mat);
+  // store pixel size for collision heuristics
+  sprite.userData.screenSize = { w: canvas.width, h: canvas.height };
+  return sprite;
 }
 
-// update label screen positions and visibility; called each frame
-function updateCountryLabels() {
-  const width = container.clientWidth;
-  const height = container.clientHeight;
-  const camDir = new THREE.Vector3();
-  camera.getWorldDirection(camDir);
-  for (const item of countryLabels) {
-    const { el, worldPos } = item;
-    // is point facing camera?
-    const toPoint = worldPos.clone().sub(camera.position).normalize();
-    const facing = toPoint.dot(camDir) > 0.12; // threshold to hide labels on far side
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function addCountryLabelSprite(name, lat, lon, priority = 0) {
+  const sprite = createLabelSprite(name);
+  const worldPos = latLonToVector3(lat, lon, (modelScaledRadius || RADIUS) + 0.01);
+  sprite.position.copy(worldPos);
+  sprite.userData.worldPos = worldPos.clone();
+  sprite.userData.priority = typeof priority === 'number' ? priority : 0;
+  // initial scale -- will be adjusted each frame to keep consistent pixel size
+  sprite.scale.set(0.4, 0.14, 1);
+  scene.add(sprite);
+  spriteLabels.push(sprite);
+}
+
+// update sprite label visibility and approximate collision avoidance
+function updateLabelSprites() {
+  const width = renderer.domElement.clientWidth;
+  const height = renderer.domElement.clientHeight;
+  // build list of candidates with screen positions
+  const candidates = [];
+  for (const s of spriteLabels) {
+    const wp = s.userData.worldPos.clone();
+    // bounding: check camera-facing
+    const toPoint = wp.clone().sub(camera.position).normalize();
+    const camDir = new THREE.Vector3();
+    camera.getWorldDirection(camDir);
+    const facing = toPoint.dot(camDir) > 0.12;
     if (!facing) {
-      el.classList.add('hidden');
+      s.visible = false;
       continue;
     }
-    // project to NDC
-    const proj = worldPos.clone().project(camera);
+    const proj = wp.project(camera);
     const x = (proj.x + 1) / 2 * width;
     const y = (-proj.y + 1) / 2 * height;
-    el.style.transform = `translate(-50%, -50%) translate(${x}px, ${y}px)`;
-    el.classList.remove('hidden');
+    candidates.push({ sprite: s, x, y, priority: s.userData.priority, wp });
+  }
+  // sort by priority desc (bigger first)
+  candidates.sort((a,b) => b.priority - a.priority);
+  const placed = [];
+  const threshold = 80; // pixel distance threshold for label collision
+  for (const c of candidates) {
+    let ok = true;
+    for (const p of placed) {
+      const dx = p.x - c.x;
+      const dy = p.y - c.y;
+      if (Math.hypot(dx, dy) < threshold) { ok = false; break; }
+    }
+    if (ok) {
+      // show
+      c.sprite.visible = true;
+      // adjust scale so sprite appears roughly constant in pixel size
+      const dist = camera.position.distanceTo(c.wp) || 1;
+      const scaleFactor = (dist * 0.08);
+      c.sprite.scale.set(scaleFactor, scaleFactor * 0.4, 1);
+      placed.push(c);
+    } else {
+      c.sprite.visible = false;
+    }
   }
 }
 

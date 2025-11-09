@@ -647,8 +647,26 @@ def api_countries_stream():
                     gshape = shape(geom)
                     if not gshape.intersects(target_box):
                         continue
-                    # If intersects, yield the feature (keep properties)
-                    out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': props }
+                    # compute centroid and priority (area) for label placement and collision
+                    try:
+                        cent = gshape.representative_point().coords[0]
+                        c_lon, c_lat = float(cent[0]), float(cent[1])
+                    except Exception:
+                        try:
+                            c = gshape.centroid
+                            c_lon, c_lat = float(c.x), float(c.y)
+                        except Exception:
+                            c_lon, c_lat = None, None
+                    try:
+                        priority = float(abs(gshape.area))
+                    except Exception:
+                        priority = 0.0
+                    # If intersects, yield the feature (keep properties) and add centroid/priority
+                    out_props = dict(props)
+                    if c_lon is not None and c_lat is not None:
+                        out_props['centroid'] = [c_lon, c_lat]
+                    out_props['label_priority'] = priority
+                    out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': out_props }
                     yield json.dumps(out) + "\n"
                     count += 1
                 else:
@@ -673,7 +691,29 @@ def api_countries_stream():
                                 break
                     if not included:
                         continue
-                    out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': props }
+                    # fallback centroid: average of coordinates (approx)
+                    c_lon, c_lat = None, None
+                    try:
+                        all_pts = []
+                        gtype = geom.get('type')
+                        if gtype == 'LineString':
+                            all_pts = geom.get('coordinates', [])
+                        elif gtype == 'MultiLineString':
+                            for part in geom.get('coordinates', []):
+                                all_pts.extend(part or [])
+                        if all_pts:
+                            sumx = 0.0; sumy = 0.0
+                            for lon, lat in all_pts:
+                                sumx += float(lon); sumy += float(lat)
+                            c_lon = sumx / len(all_pts); c_lat = sumy / len(all_pts)
+                    except Exception:
+                        c_lon, c_lat = None, None
+                    out_props = dict(props)
+                    if c_lon is not None and c_lat is not None:
+                        out_props['centroid'] = [c_lon, c_lat]
+                    # priority fallback: number of points
+                    out_props['label_priority'] = float(len(all_pts) if 'all_pts' in locals() else 0)
+                    out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': out_props }
                     yield json.dumps(out) + "\n"
                     count += 1
             except Exception as e:
