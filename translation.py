@@ -91,7 +91,47 @@ def is_building(element):
 # -----------------------------------------------------------
 # Processing functions
 # -----------------------------------------------------------
-def process_element(element):
+def get_icon_for_element(element, icon_map):
+    """
+    Assign an icon based on tags:
+    - Recreational amenities get generic recreational icon
+    - Other amenities use value-specific icons if available, otherwise default
+    - Natural uses one generic icon
+    - Emergency uses value-specific icons
+    - Other keys use default per key or global fallback
+    """
+    tags = element.get('tags', {})
+
+    for key, value in tags.items():
+        # --- Amenity ---
+        if key == 'amenity':
+            recreation_list = [
+                "bar", "bbq", "brothel", "cafe", "cinema", "food_court",
+                "marketplace", "nightclub", "restaurant", "swinger_club",
+                "theatre", "vending_machine"
+            ]
+            if value in recreation_list:
+                return icon_map['amenity'].get(value, icon_map['amenity']['_default'])
+            # Non-recreation amenities: use value-specific icon if exists, else default
+            return icon_map['amenity'].get(value, icon_map['amenity']['_default'])
+
+        # --- Emergency ---
+        if key == 'emergency':
+            return icon_map['emergency'].get(value, icon_map['emergency']['_default'])
+
+        # --- Natural ---
+        if key == 'natural':
+            return icon_map['natural']['_default']
+
+        # --- Other keys ---
+        if key in icon_map:
+            return icon_map[key].get('_default', icon_map['_global_default']['_default'])
+
+    # --- Global fallback ---
+    return icon_map['_global_default']['_default']
+
+
+def process_element(element, icon_map):
     """Compute center, elevation, and height (if any)."""
     lat = sum(p['lat'] for p in element['points']) / len(element['points'])
     lon = sum(p['lon'] for p in element['points']) / len(element['points'])
@@ -103,13 +143,16 @@ def process_element(element):
         "effective_height": 0.0 # USE THIS
     }
 
+    icon = get_icon_for_element(element, icon_map)
+
     return {
         'id': element['id'],
         'points': element['points'],
         'centroid': {'lat': lat, 'lon': lon},
         'base_elev': base_elev,
         **height_info,
-        'tags': element['tags']
+        'tags': element['tags'],
+        'icon': icon
     }
 
 # -----------------------------------------------------------
@@ -125,6 +168,124 @@ def process_osm_json(json_string):
     """
     osm_data = json.loads(json_string)
     all_elements = extract_elements(osm_data)
-    processed = [process_element(el) for el in all_elements]
+    processed = [process_element(el, ICON_MAP) for el in all_elements]
     return processed
 # for any buildings with height, please use effective_height
+
+ICON_MAP = {
+    # ------------------- AMENITY -------------------
+    "amenity": {
+        # --- Recreational amenities (generic icon) ---
+        "bar": "icons/amenity_recreational.svg",
+        "bbq": "icons/amenity_recreational.svg",
+        "brothel": "icons/amenity_recreational.svg",
+        "cafe": "icons/amenity_recreational.svg",
+        "cinema": "icons/amenity_recreational.svg",
+        "food_court": "icons/amenity_recreational.svg",
+        "marketplace": "icons/amenity_recreational.svg",
+        "nightclub": "icons/amenity_recreational.svg",
+        "restaurant": "icons/amenity_recreational.svg",
+        "swinger_club": "icons/amenity_recreational.svg",
+        "theatre": "icons/amenity_recreational.svg",
+        "vending_machine": "icons/amenity_recreational.svg",
+
+        # --- Other amenities with value-specific icons ---
+        "bicycle_parking": "icons/amenity_bicycle.svg",
+        "bicycle_rental": "icons/amenity_bicycle.svg",
+
+        "charging_station": "icons/amenity_charging_station.svg",
+
+        "clinic": "icons/health.svg",
+        "dentist": "icons/health.svg",
+        "doctors": "icons/health.svg",
+        "hospital": "icons/health.svg",
+        "pharmacy": "icons/health.svg",
+
+        "college": "icons/amenity_education.svg",
+        "kindergarten": "icons/amenity_education.svg",
+        "school": "icons/amenity_education.svg",
+
+        "courthouse": "icons/amenity_courthouse.svg",
+        "fire_station": "icons/emergency_fire_station.svg",
+        "police": "icons/emergency_police.svg",
+
+        "car_rental": "icons/amenity_car.svg",
+        "car_sharing": "icons/amenity_car.svg",
+        "fuel": "icons/amenity_car.svg",
+        "parking": "icons/amenity_car.svg",
+
+        "ferry_terminal": "icons/amenity_ferry_terminal.svg",
+        "grave_yard": "icons/amenity_grave_yard.svg",
+        "library": "icons/amenity_library.svg",
+        "place_of_worship": "icons/amenity_place_of_worship.svg",
+
+        "post_box": "icons/amenity_post.svg",
+        "post_office": "icons/amenity_post.svg",
+
+        "prison": "icons/amenity_prison.svg",
+        "public_building": "icons/amenity_public_building.svg",
+        "recycling": "icons/amenity_recycling.svg",
+        "shelter": "icons/amenity_shelter.svg",
+
+        "taxi": "icons/amenity_taxi.svg",
+
+        "telephone": "icons/amenity_telephone.svg",
+        "toilets": "icons/amenity_toilets.svg",
+        "townhall": "icons/amenity_townhall.svg",
+
+        "drinking_water": "icons/amenity_water.svg",
+        "water_point": "icons/amenity_water.svg",
+
+        # --- Fallback for any other amenity ---
+        "_default": "icons/amenity.svg"
+    },
+
+    # ------------------- NATURAL (single icon) -------------------
+    "natural": {
+        "_default": "icons/natural.svg"
+    },
+
+    # ------------------- EMERGENCY -------------------
+    "emergency": {
+        "ambulance_station": "icons/emergency_ambulance_station.svg",
+        "fire_station": "icons/emergency_fire_station.svg",
+        "lifeguard_station": "icons/emergency_lifeguard_station.svg",
+        "police": "icons/emergency_police.svg",
+        "first_aid": "icons/emergency_first_aid.svg",
+        "defibrillator": "icons/emergency_first_aid.svg",
+        "assembly_point": "icons/emergency_assembly_point.svg",
+        "_default": "icons/emergency.svg"
+    },
+
+    # ------------------- OTHER KEYS (generic default per key) -------------------
+    "aerialway":   {"_default": "icons/aerialway.svg"},
+    "aeroway":     {"_default": "icons/aeroway.svg"},
+    "barrier":     {"_default": "icons/barrier.svg"},
+    "boundary":    {"_default": "icons/boundary.svg"},
+    "building":    {"_default": "icons/building.svg"},
+    "craft":       {"_default": "icons/craft.svg"},
+    "geological":  {"_default": "icons/geological.svg"},
+    "healthcare":  {"_default": "icons/health.svg"},
+    "highway":     {"_default": "icons/highway.svg"},
+    "historic":    {"_default": "icons/historic.svg"},
+    "landuse":     {"_default": "icons/landuse.svg"},
+    "leisure":     {"_default": "icons/leisure.svg"},
+    "man_made":    {"_default": "icons/man_made.svg"},
+    "military":    {"_default": "icons/military.svg"},
+    "office":      {"_default": "icons/office.svg"},
+    "place":       {"_default": "icons/place.svg"},
+    "power":       {"_default": "icons/power.svg"},
+    "public_transport": {"_default": "icons/public_transport.svg"},
+    "railway":     {"_default": "icons/railway.svg"},
+    "route":       {"_default": "icons/route.svg"},
+    "shop":        {"_default": "icons/shop.svg"},
+    "telecom":     {"_default": "icons/telecom.svg"},
+    "tourism":     {"_default": "icons/tourism.svg"},
+    "water":       {"_default": "icons/water.svg"},
+    "waterway":    {"_default": "icons/waterway.svg"},
+    
+    # ------------------- GLOBAL FALLBACK -------------------
+    "_global_default": {"_default": "icons/default.svg"}
+}
+
+# MUST USE THIS TO GET ICON
