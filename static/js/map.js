@@ -717,7 +717,7 @@ document.getElementById('locate-me').addEventListener('click', () => {
     const lon = pos.coords.longitude;
     centerOnLatLon(lat, lon, 3.0);
 
-    clearIconMarkers();
+    clearIconMarkers(); // clear icons
 
     // initial fetch uses radius based on current camera distance
     const dist = camera.position.distanceTo(controls.target || new THREE.Vector3());
@@ -725,6 +725,7 @@ document.getElementById('locate-me').addEventListener('click', () => {
     fetchOverpass(lat, lon, radius);
     clearStatus();
 
+    // THIS CODE HERE is for adding icons onto the map
     getOsmJson(lat, lon, radius)
       .then(osmData => processOsmJson(JSON.stringify(osmData)))
       .then(processedElements => {
