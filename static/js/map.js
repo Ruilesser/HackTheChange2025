@@ -113,6 +113,70 @@ let overpassCooldownUntil = 0; // ms timestamp until which we should not issue n
 const OVERPASS_COOLDOWN_DEFAULT_MS = 60 * 1000; // 60s cooldown on 429
 function inOverpassCooldown() { return Date.now() < (overpassCooldownUntil || 0); }
 
+// stream idle read timeout (ms): if no chunk arrives within this window, cancel the stream
+const OVERPASS_STREAM_IDLE_MS = 12000;
+
+// Throttle / concurrency controls to avoid spamming Overpass
+let lastOverpassRequestAt = 0;
+const MIN_OVERPASS_INTERVAL_MS = 1200; // minimum time between starting requests
+let inFlightOverpassRequests = 0;
+const MAX_CONCURRENT_OVERPASS = 1;
+let pendingOverpassTimer = null;
+
+// simple in-memory cache to avoid re-requesting recently fetched tiles/areas
+const overpassCache = new Map(); // key -> { ts, ttlMs }
+const OVERPASS_CACHE_TTL_MS = 60 * 1000; // 60s
+
+function makeOverpassCacheKey(lat, lon, radius) {
+  // coarse grid to group nearby requests
+  const latKey = (Math.round(lat * 20) / 20).toFixed(3); // 0.05 deg bins
+  const lonKey = (Math.round(lon * 20) / 20).toFixed(3);
+  const rKey = Math.round(radius / 200) * 200; // 200m buckets
+  return `${latKey}:${lonKey}:${rKey}`;
+}
+
+function scheduleOverpassFetch(lat, lon, radius) {
+  // if in cooldown, skip
+  if (inOverpassCooldown()) {
+    setStatus('Overpass cooldown active — delaying request', 'error', 3000);
+    return;
+  }
+  const key = makeOverpassCacheKey(lat, lon, radius);
+  const cached = overpassCache.get(key);
+  if (cached && (Date.now() - cached.ts) < (cached.ttlMs || OVERPASS_CACHE_TTL_MS)) {
+    // recently fetched — skip
+    console.debug('Using cached Overpass key', key);
+    return;
+  }
+
+  const tryStart = () => {
+    const now = Date.now();
+    if (inFlightOverpassRequests >= MAX_CONCURRENT_OVERPASS) {
+      // retry after a short delay
+      pendingOverpassTimer = setTimeout(tryStart, 400);
+      return;
+    }
+    const since = now - (lastOverpassRequestAt || 0);
+    if (since < MIN_OVERPASS_INTERVAL_MS) {
+      pendingOverpassTimer = setTimeout(tryStart, MIN_OVERPASS_INTERVAL_MS - since + 50);
+      return;
+    }
+    // mark and start
+    inFlightOverpassRequests++;
+    lastOverpassRequestAt = now;
+    // mark cache immediately to avoid duplicate parallel attempts
+    overpassCache.set(key, { ts: now, ttlMs: OVERPASS_CACHE_TTL_MS });
+    // call the fetch
+    fetchOverpass(lat, lon, radius)
+      .catch(err => console.warn('fetchOverpass error', err))
+      .finally(() => { inFlightOverpassRequests = Math.max(0, inFlightOverpassRequests - 1); });
+  };
+
+  // schedule immediate attempt
+  if (pendingOverpassTimer) { clearTimeout(pendingOverpassTimer); pendingOverpassTimer = null; }
+  pendingOverpassTimer = setTimeout(tryStart, 0);
+}
+
 // Sprite-based labels (Three.js) for performance and consistent scaling
 const spriteLabels = []; // array of sprites
 // index to deduplicate labels by name or centroid key -> sprite
@@ -531,6 +595,7 @@ function simplifyCoords(coords, maxPoints) {
 
 async function fetchOverpass(lat, lon, radiusMeters) {
   setStatus('Preparing OSM request — computing radius and method...', 'loading', 8000);
+  const cacheKey = makeOverpassCacheKey(lat, lon, radiusMeters);
   // use streaming endpoint for larger radii to avoid large single responses
   const useStream = radiusMeters > 3000;
   try {
@@ -554,10 +619,14 @@ async function fetchOverpass(lat, lon, radiusMeters) {
         // handle rate-limit specially
         if (res.status === 429) {
           overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+          // remove cache so we can retry later
+          try { overpassCache.delete(cacheKey); } catch (e) {}
           setStatus('Overpass rate limit reached — pausing requests for 60s', 'error', 8000);
           return;
         }
         const txt = await res.text();
+        // on other errors, remove cache so we don't falsely suppress retries
+        try { overpassCache.delete(cacheKey); } catch (e) {}
         throw new Error('Overpass API request failed: ' + txt);
       }
       const geojson = await res.json();
@@ -599,6 +668,7 @@ async function fetchOverpass(lat, lon, radiusMeters) {
     }
   } catch (err) {
     console.error('Failed to fetch/parse Overpass data', err);
+    try { overpassCache.delete(cacheKey); } catch (e) {}
     alert('Failed to load Overpass data: ' + err.message);
   } finally {
     clearStatus();
@@ -607,11 +677,12 @@ async function fetchOverpass(lat, lon, radiusMeters) {
 
 async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
   clearFeatures();
+  // remember cache key so we can remove it if the stream fails due to rate-limiting
+  const cacheKey = makeOverpassCacheKey(lat, lon, radiusMeters);
   const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
   // attach observer center so server can cull far-side features
   try {
-    const center = controls.target.clone();
-    const centerLatLon = vector3ToLatLon(center);
+    const centerLatLon = getSubSatelliteLatLon();
     if (centerLatLon && typeof centerLatLon.lat === 'number') {
       qs.set('observer_lat', String(centerLatLon.lat));
       qs.set('observer_lon', String(centerLatLon.lon));
@@ -632,6 +703,14 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
   if (!res.ok) {
     const txt = await res.text();
     setStatus('Overpass stream request failed (server error)', 'error', 8000);
+    // handle 429 specially
+    if (res.status === 429) {
+      overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+      // remove cache entry so we don't permanently suppress retries for this area
+      try { overpassCache.delete(cacheKey); } catch (e) {}
+      setStatus('Overpass rate limit reached — pausing requests for 60s', 'error', 8000);
+      return;
+    }
     throw new Error('Overpass stream failed: ' + txt);
   }
   const reader = res.body.getReader();
@@ -644,78 +723,103 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
   const projScreenMatrix = new THREE.Matrix4();
   projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   frustum.setFromProjectionMatrix(projScreenMatrix);
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let lines = buf.split('\n');
-    buf = lines.pop();
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let obj;
+  // helper to read with idle timeout
+  async function readChunkWithTimeout(ms) {
+    const readPromise = reader.read();
+    const timeoutPromise = new Promise((_, rej) => setTimeout(() => rej(new Error('stream-read-timeout')), ms));
+    return Promise.race([readPromise, timeoutPromise]);
+  }
+  // Run the stream processing inside try/catch so any unexpected exception cancels the reader
+  try {
+    while (true) {
+      let done, value;
       try {
-        obj = JSON.parse(line);
+        const r = await readChunkWithTimeout(OVERPASS_STREAM_IDLE_MS);
+        ({ done, value } = r);
       } catch (e) {
-        console.warn('Failed to parse NDJSON line', e, line);
-        continue;
+        // idle timeout or other read error — cancel and abort stream processing
+        console.warn('Overpass stream read idle or error, cancelling:', e && e.message);
+        setStatus('No data from Overpass stream — aborting', 'error', 6000);
+        return;
       }
-      if (obj._error) {
-        console.warn('Overpass tile error', obj);
-        // If server reports Overpass rate limiting (429) for a tile, pause further Overpass queries
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let obj;
         try {
-          const details = String(obj.details || '').toLowerCase();
-          if (details.includes('429') || details.includes('too many requests')) {
-            overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
-            setStatus('Overpass rate limit reached (tile requests) — pausing for 60s', 'error', 8000);
-            try { await reader.cancel(); } catch (e) { /* ignore */ }
-            return; // stop processing the stream
-          }
+          obj = JSON.parse(line);
         } catch (e) {
-          // ignore parsing errors
+          console.warn('Failed to parse NDJSON line', e, line);
+          continue;
         }
-        continue;
-      }
-      if (obj._meta) {
-        // progress or done marker - the server may emit summaries here
-        if (obj._meta && obj._meta.message) {
-          setStatus(obj._meta.message, 'loading', null);
+        if (obj._error) {
+          console.warn('Overpass tile error', obj);
+          // If server reports Overpass rate limiting (429) for a tile, pause further Overpass queries
+          try {
+            const details = String(obj.details || '').toLowerCase();
+            if (details.includes('429') || details.includes('too many requests')) {
+              overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+              // remove cache entry so we can retry after cooldown rather than being blocked
+              try { overpassCache.delete(cacheKey); } catch (e) {}
+              setStatus('Overpass rate limit reached (tile requests) — pausing for 60s', 'error', 8000);
+              return; // stop processing the stream
+            }
+          } catch (e) {
+            // ignore parsing errors
+          }
+          continue;
         }
-        continue;
-      }
-      // treat as GeoJSON Feature
-      const geom = obj.geometry;
-      if (!geom) continue;
-      // lightweight client-side culling: find rep lat/lon and test frustum/backface
-      let repLat = null, repLon = null;
-      if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
-        repLon = parseFloat(obj.properties.centroid[0]);
-        repLat = parseFloat(obj.properties.centroid[1]);
-      } else {
-        const rep = geometryRepresentativeLatLon(geom);
-        if (rep) { repLat = rep.lat; repLon = rep.lon; }
-      }
-      if (repLat !== null && repLon !== null) {
-        const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.005);
-        const toPoint = worldPos.clone().sub(camera.position).normalize();
-        if (toPoint.dot(camDir) <= 0) continue;
-        if (!frustum.containsPoint(worldPos)) continue;
-      }
-      if (geom.type === 'Point') {
-        const [lon, lat] = geom.coordinates;
-        renderPoint(lat, lon, 0xff5533, 0.02);
-        featureCount++;
-      } else if (geom.type === 'LineString') {
-        renderLine(geom.coordinates, 0x00ff88);
-        featureCount++;
-      } else if (geom.type === 'Polygon') {
-        renderPolygon(geom.coordinates, 0x009988);
-        featureCount++;
-      }
-      // update status occasionally to show progress
-      if (featureCount > 0 && featureCount % 200 === 0) {
-        setStatus(`Streaming OSM features… ${featureCount} features received`, 'loading', null);
+        if (obj._meta) {
+          // progress or done marker - the server may emit summaries here
+          if (obj._meta && obj._meta.message) {
+            setStatus(obj._meta.message, 'loading', null);
+          }
+          continue;
+        }
+        // treat as GeoJSON Feature
+        const geom = obj.geometry;
+        if (!geom) continue;
+        // lightweight client-side culling: find rep lat/lon and test frustum/backface
+        let repLat = null, repLon = null;
+        if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
+          repLon = parseFloat(obj.properties.centroid[0]);
+          repLat = parseFloat(obj.properties.centroid[1]);
+        } else {
+          const rep = geometryRepresentativeLatLon(geom);
+          if (rep) { repLat = rep.lat; repLon = rep.lon; }
+        }
+        if (repLat !== null && repLon !== null) {
+          const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.005);
+          const toPoint = worldPos.clone().sub(camera.position).normalize();
+          if (toPoint.dot(camDir) <= 0) continue;
+          if (!frustum.containsPoint(worldPos)) continue;
+        }
+        if (geom.type === 'Point') {
+          const [lon, lat] = geom.coordinates;
+          renderPoint(lat, lon, 0xff5533, 0.02);
+          featureCount++;
+        } else if (geom.type === 'LineString') {
+          renderLine(geom.coordinates, 0x00ff88);
+          featureCount++;
+        } else if (geom.type === 'Polygon') {
+          renderPolygon(geom.coordinates, 0x009988);
+          featureCount++;
+        }
+        // update status occasionally to show progress
+        if (featureCount > 0 && featureCount % 200 === 0) {
+          setStatus(`Streaming OSM features… ${featureCount} features received`, 'loading', null);
+        }
       }
     }
+  } catch (streamErr) {
+    console.error('Error processing Overpass stream:', streamErr);
+    setStatus('Error processing Overpass stream', 'error', 6000);
+  } finally {
+    // ensure reader is released
+    try { await reader.cancel(); } catch (e) { /* ignore */ }
   }
   // parse final buffer
   if (buf.trim()) {
@@ -756,9 +860,10 @@ document.getElementById('locate-me').addEventListener('click', () => {
     clearIconMarkers(); // clear icons
 
     // initial fetch uses radius based on current camera distance
-    const dist = camera.position.distanceTo(controls.target || new THREE.Vector3());
-    const radius = cameraDistanceToRadius(dist);
-    fetchOverpass(lat, lon, radius);
+  const dist = camera.position.distanceTo(controls.target || new THREE.Vector3());
+  const radius = cameraDistanceToRadius(dist);
+  // schedule via throttler
+  scheduleOverpassFetch(lat, lon, radius);
     clearStatus();
 
     // THIS CODE HERE is for adding icons onto the map
@@ -885,7 +990,8 @@ function scheduleFetchForControls() {
     const radius = cameraDistanceToRadius(dist);
     if (shouldFetch(lat, lon, radius)) {
       lastFetch = { lat, lon, radius };
-      fetchOverpass(lat, lon, radius);
+      // use scheduled/throttled fetch to avoid spamming Overpass
+      scheduleOverpassFetch(lat, lon, radius);
     }
   }, 600);
 }
