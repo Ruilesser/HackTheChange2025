@@ -81,7 +81,6 @@ let modelScaledRadius = RADIUS;
 // how far to push labels out from the globe surface to avoid z-fighting/clipping
 const LABEL_OFFSET = 0.03;
 {
-  // sphereGeo -> 64 x 64 (64 x units, 64 y units)
   const sphereGeo = new THREE.SphereGeometry(RADIUS, 64, 64);
   const mat = new THREE.MeshStandardMaterial({ color: 0x2266aa, roughness: 1 });
   globe = new THREE.Mesh(sphereGeo, mat);
@@ -219,6 +218,18 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
     params.set('radius', String(radius));
   }
 
+  // include observer (controls.target) so server can perform hemisphere/backface culling
+  try {
+    const center = controls.target.clone();
+    const centerLatLon = vector3ToLatLon(center);
+    if (centerLatLon && typeof centerLatLon.lat === 'number') {
+      params.set('observer_lat', String(centerLatLon.lat));
+      params.set('observer_lon', String(centerLatLon.lon));
+    }
+  } catch (e) {
+    // ignore
+  }
+
   const res = await fetch(`/api/countries_stream?${params.toString()}`);
   if (!res.ok) {
     const txt = await res.text();
@@ -260,6 +271,23 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       // expect feature with geometry LineString/MultiLineString
       const geom = obj.geometry;
       if (!geom) continue;
+      // culling: determine representative lat/lon for geometry (server may have added centroid)
+      let repLat = null, repLon = null;
+      if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
+        repLon = parseFloat(obj.properties.centroid[0]);
+        repLat = parseFloat(obj.properties.centroid[1]);
+      } else {
+        const rep = geometryRepresentativeLatLon(geom);
+        if (rep) { repLat = rep.lat; repLon = rep.lon; }
+      }
+      if (repLat !== null && repLon !== null) {
+        const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
+        // backface: check facing relative to camera direction
+        const toPoint = worldPos.clone().sub(camera.position).normalize();
+        if (toPoint.dot(camDir) <= 0) continue; // behind globe
+        // frustum test: skip if outside view frustum
+        if (!frustum.containsPoint(worldPos)) continue;
+      }
       if (geom.type === 'LineString') {
         renderCountryLine(geom.coordinates, 0xffffff, 1);
         addedCountryGeoms++;
@@ -297,8 +325,26 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       const obj = JSON.parse(buf.trim());
       if (obj && obj.geometry) {
         const geom = obj.geometry;
-        if (geom.type === 'LineString') renderCountryLine(geom.coordinates, 0xffffff, 1);
-        else if (geom.type === 'MultiLineString') for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+        // final item: apply same lightweight culling
+        let repLat = null, repLon = null;
+        if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
+          repLon = parseFloat(obj.properties.centroid[0]);
+          repLat = parseFloat(obj.properties.centroid[1]);
+        } else {
+          const rep = geometryRepresentativeLatLon(geom);
+          if (rep) { repLat = rep.lat; repLon = rep.lon; }
+        }
+        if (repLat !== null && repLon !== null) {
+          const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
+          const toPoint = worldPos.clone().sub(camera.position).normalize();
+          if (toPoint.dot(camDir) > 0 && frustum.containsPoint(worldPos)) {
+            if (geom.type === 'LineString') renderCountryLine(geom.coordinates, 0xffffff, 1);
+            else if (geom.type === 'MultiLineString') for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+          }
+        } else {
+          if (geom.type === 'LineString') renderCountryLine(geom.coordinates, 0xffffff, 1);
+          else if (geom.type === 'MultiLineString') for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+        }
       }
     } catch (e) {
       // ignore
@@ -488,16 +534,47 @@ async function fetchOverpass(lat, lon, radiusMeters) {
       await fetchOverpassStream(lat, lon, radiusMeters);
     } else {
       const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
+      // attach observer center so server can cull far-side features
+      try {
+        const center = controls.target.clone();
+        const centerLatLon = vector3ToLatLon(center);
+        if (centerLatLon && typeof centerLatLon.lat === 'number') {
+          qs.set('observer_lat', String(centerLatLon.lat));
+          qs.set('observer_lon', String(centerLatLon.lon));
+        }
+      } catch (e) {}
       const res = await fetch(`/api/overpass?${qs.toString()}`);
       if (!res.ok) {
         const txt = await res.text();
         throw new Error('Overpass API request failed: ' + txt);
       }
       const geojson = await res.json();
+      // prepare frustum / camera direction for client-side culling
+      const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
+      const frustum = new THREE.Frustum();
+      const projScreenMatrix = new THREE.Matrix4();
+      projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+      frustum.setFromProjectionMatrix(projScreenMatrix);
+
       clearFeatures();
       for (const feat of geojson.features || []) {
         const geom = feat.geometry;
         if (!geom) continue;
+        // determine representative lat/lon
+        let repLat = null, repLon = null;
+        if (feat.properties && feat.properties.centroid && feat.properties.centroid.length >= 2) {
+          repLon = parseFloat(feat.properties.centroid[0]);
+          repLat = parseFloat(feat.properties.centroid[1]);
+        } else {
+          const rep = geometryRepresentativeLatLon(geom);
+          if (rep) { repLat = rep.lat; repLon = rep.lon; }
+        }
+        if (repLat !== null && repLon !== null) {
+          const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
+          const toPoint = worldPos.clone().sub(camera.position).normalize();
+          if (toPoint.dot(camDir) <= 0) continue; // behind globe
+          if (!frustum.containsPoint(worldPos)) continue; // outside view
+        }
         if (geom.type === 'Point') {
           const [lon, lat] = geom.coordinates;
           renderPoint(lat, lon, 0xff5533, 0.02);
@@ -519,6 +596,15 @@ async function fetchOverpass(lat, lon, radiusMeters) {
 async function fetchOverpassStream(lat, lon, radiusMeters) {
   clearFeatures();
   const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
+  // attach observer center so server can cull far-side features
+  try {
+    const center = controls.target.clone();
+    const centerLatLon = vector3ToLatLon(center);
+    if (centerLatLon && typeof centerLatLon.lat === 'number') {
+      qs.set('observer_lat', String(centerLatLon.lat));
+      qs.set('observer_lon', String(centerLatLon.lon));
+    }
+  } catch (e) {}
   const res = await fetch(`/api/overpass_stream?${qs.toString()}`);
   if (!res.ok) {
     const txt = await res.text();
@@ -528,6 +614,12 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
+  // prepare frustum/camera direction for local culling
+  const camDir = new THREE.Vector3(); camera.getWorldDirection(camDir);
+  const frustum = new THREE.Frustum();
+  const projScreenMatrix = new THREE.Matrix4();
+  projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  frustum.setFromProjectionMatrix(projScreenMatrix);
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -557,6 +649,21 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
       // treat as GeoJSON Feature
       const geom = obj.geometry;
       if (!geom) continue;
+      // lightweight client-side culling: find rep lat/lon and test frustum/backface
+      let repLat = null, repLon = null;
+      if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
+        repLon = parseFloat(obj.properties.centroid[0]);
+        repLat = parseFloat(obj.properties.centroid[1]);
+      } else {
+        const rep = geometryRepresentativeLatLon(geom);
+        if (rep) { repLat = rep.lat; repLon = rep.lon; }
+      }
+      if (repLat !== null && repLon !== null) {
+        const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.005);
+        const toPoint = worldPos.clone().sub(camera.position).normalize();
+        if (toPoint.dot(camDir) <= 0) continue;
+        if (!frustum.containsPoint(worldPos)) continue;
+      }
       if (geom.type === 'Point') {
         const [lon, lat] = geom.coordinates;
         renderPoint(lat, lon, 0xff5533, 0.02);
@@ -593,6 +700,7 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
       console.warn('final NDJSON parse failed', e, buf);
     }
   }
+  setStatus(`Done — streamed ${featureCount} features`, 'info', 6000);
 }
 
 // Geolocation: center on user's current position
@@ -706,9 +814,13 @@ controls.addEventListener('end', scheduleFetchForControls);
 function onWindowResize() {
   const width = container.clientWidth;
   const height = container.clientHeight;
-  camera.aspect = width / height || 2;
+  // avoid division by zero; ensure sensible aspect
+  camera.aspect = (height > 0) ? (width / height) : camera.aspect;
   camera.updateProjectionMatrix();
-  renderer.setSize(width, height, false);
+  // update size and also update the canvas style to match
+  renderer.setSize(width, height, true);
+  renderer.domElement.style.width = width + 'px';
+  renderer.domElement.style.height = height + 'px';
 }
 
 window.addEventListener('resize', onWindowResize, false);
@@ -717,10 +829,29 @@ onWindowResize();
 // animation loop
 function animate() {
   requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.max(0.001, now - lastFrameTime); // ms
+  lastFrameTime = now;
+  const instFps = 1000.0 / dt;
+  // exponential smoothing for FPS display
+  smoothedFps = smoothedFps * 0.93 + instFps * 0.07;
+  // update frameTimes buffer
+  frameTimes.push(dt);
+  if (frameTimes.length > FRAME_HISTORY) frameTimes.shift();
+
   controls.update();
   renderer.render(scene, camera);
   // update labels after render to ensure camera/projection are current
   updateLabelSprites();
+
+  // compute ms stats
+  let avg = 0, min = Infinity, max = 0;
+  for (const t of frameTimes) { avg += t; if (t < min) min = t; if (t > max) max = t; }
+  const n = frameTimes.length || 1;
+  avg = avg / n;
+  if (min === Infinity) min = 0;
+  // update UI
+  fpsCounter.innerHTML = `FPS: ${smoothedFps.toFixed(1)} &nbsp;|&nbsp; frame: ${dt.toFixed(1)} ms<br>avg: ${avg.toFixed(1)} ms (min ${min.toFixed(1)} / max ${max.toFixed(1)})`;
 }
 
 animate();
