@@ -54,6 +54,30 @@ function passAllDataTo(targetFunction) {
   return allData;
 }
 
+
+// Function to pass all acquired data to any other function
+function useAcquiredData(callback) {
+  if (typeof callback === 'function') {
+    const allData = {
+      osm: lastOsmData,
+      countries: lastCountryData,
+      icons: lastIconData,
+      metadata: {
+        timestamp: Date.now(),
+        osmFeatureCount: lastOsmData?.features?.length || 0,
+        countryFeatureCount: lastCountryData.length,
+        viewState: getSubSatelliteLatLon()
+      }
+    };
+    callback(allData);
+  }
+  return {
+    osm: lastOsmData,
+    countries: lastCountryData,
+    icons: lastIconData
+  };
+}
+
 // Observer culling toggle (controls both client-side culling and whether
 // we send an observer_lat/observer_lon to server endpoints). Default: disabled.
 // Set false so features are rendered by default (no client/server culling)
@@ -519,6 +543,11 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
         continue;
       }
       if (obj._meta) continue;
+
+      if (obj.geometry && (obj.geometry.type === 'LineString' || obj.geometry.type === 'MultiLineString')) {
+        lastCountryData.push(obj);
+      }
+
       // expect feature with geometry LineString/MultiLineString
       const geom = obj.geometry;
       if (!geom) continue;
