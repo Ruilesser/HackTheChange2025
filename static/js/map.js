@@ -9,7 +9,7 @@ class AIService {
     this.model = this.genAI.getGenerativeModel({ model: "gemini-pro" });
   }
 
-  async submit(timeout = 5000) {
+  async submit(data, timeout = 5000) {
     try {
       // Add your JSON data to the prompt
       const fullPrompt = `You are an advanced urban planning, sustainability, and community-development analysis model. You produce formal, narrative, human-readable reports, written for community leaders, municipal planners, and urban development authorities. You must never output JSON, code, bullet-free raw data dumps, or any machine-formatted structure. Your output must always be a coherent, multi-section written report in professional planning language. You will analyze this JSON consisting of restaurants, hospitals, and other amenities and services, and in turn you will give recommendations for improving urban planning, sustainability, and community development based on the data provided. Your report must be at least 500 words long and cover multiple aspects of urban planning and community development. Here is the data: ${JSON.stringify(data)}`;
