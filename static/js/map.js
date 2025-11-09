@@ -34,6 +34,20 @@ debugOverlay.style.pointerEvents = 'none';
 debugOverlay.innerHTML = '';
 container.appendChild(debugOverlay);
 
+// Observer culling toggle (controls both client-side culling and whether
+// we send an observer_lat/observer_lon to server endpoints). Default: enabled.
+let observerCullingEnabled = true;
+const observerCullingToggleEl = document.getElementById('toggle-observer-culling');
+if (observerCullingToggleEl) {
+  try {
+    observerCullingEnabled = !!observerCullingToggleEl.checked;
+    observerCullingToggleEl.addEventListener('change', (ev) => {
+      observerCullingEnabled = !!ev.target.checked;
+      setStatus(`Observer culling ${observerCullingEnabled ? 'enabled' : 'disabled'}`, 'info', 2000);
+    });
+  } catch (e) { /* ignore UI hookup errors */ }
+}
+
 // Enable verbose logging for country outline streaming when debugging
 const DEBUG_COUNTRY_STREAM = true;
 
@@ -414,10 +428,12 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
 
   // include observer (sub-satellite point computed from camera) so server can perform hemisphere/backface culling
   try {
-    const centerLatLon = getSubSatelliteLatLon();
-    if (centerLatLon && typeof centerLatLon.lat === 'number') {
-      params.set('observer_lat', String(centerLatLon.lat));
-      params.set('observer_lon', String(centerLatLon.lon));
+    if (observerCullingEnabled) {
+      const centerLatLon = getSubSatelliteLatLon();
+      if (centerLatLon && typeof centerLatLon.lat === 'number') {
+        params.set('observer_lat', String(centerLatLon.lat));
+        params.set('observer_lon', String(centerLatLon.lon));
+      }
     }
   } catch (e) {
     // ignore
@@ -487,9 +503,14 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
         if (DEBUG_COUNTRY_STREAM) {
           console.debug('countries_stream: cull-check', { repLat, repLon, dot, inFrustum });
         }
-        if (dot <= 0) continue; // behind globe
-        // frustum test: skip if outside view frustum
-        if (!inFrustum) continue;
+        // Apply lightweight client-side culling only when enabled. When disabled,
+        // we'll keep all streamed segments so the server-side culling (if any)
+        // or a full dataset can be displayed.
+        if (observerCullingEnabled) {
+          if (dot <= 0) continue; // behind globe
+          // frustum test: skip if outside view frustum
+          if (!inFrustum) continue;
+        }
       }
       if (geom.type === 'LineString') {
         renderCountryLine(geom.coordinates, 0xffffff, 1, countryBordersPending);
@@ -545,7 +566,8 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
         if (repLat !== null && repLon !== null) {
           const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
           const toPoint = worldPos.clone().sub(camera.position).normalize();
-          if (toPoint.dot(camDir) > 0 && frustum.containsPoint(worldPos)) {
+          const passesCull = observerCullingEnabled ? (toPoint.dot(camDir) > 0 && frustum.containsPoint(worldPos)) : true;
+          if (passesCull) {
             if (geom.type === 'LineString') renderCountryLine(geom.coordinates, 0xffffff, 1);
             else if (geom.type === 'MultiLineString') for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
           }
@@ -763,10 +785,12 @@ async function fetchOverpass(lat, lon, radiusMeters) {
       const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
       // attach observer center (sub-satellite point computed from camera) so server can cull far-side features
       try {
-        const centerLatLon = getSubSatelliteLatLon();
-        if (centerLatLon && typeof centerLatLon.lat === 'number') {
-          qs.set('observer_lat', String(centerLatLon.lat));
-          qs.set('observer_lon', String(centerLatLon.lon));
+        if (observerCullingEnabled) {
+          const centerLatLon = getSubSatelliteLatLon();
+          if (centerLatLon && typeof centerLatLon.lat === 'number') {
+            qs.set('observer_lat', String(centerLatLon.lat));
+            qs.set('observer_lon', String(centerLatLon.lon));
+          }
         }
       } catch (e) {}
       setStatus('Requesting Overpass (synchronous) — waiting for server...', 'loading', 15000);
@@ -810,8 +834,10 @@ async function fetchOverpass(lat, lon, radiusMeters) {
         if (repLat !== null && repLon !== null) {
           const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
           const toPoint = worldPos.clone().sub(camera.position).normalize();
-          if (toPoint.dot(camDir) <= 0) continue; // behind globe
-          if (!frustum.containsPoint(worldPos)) continue; // outside view
+          if (observerCullingEnabled) {
+            if (toPoint.dot(camDir) <= 0) continue; // behind globe
+            if (!frustum.containsPoint(worldPos)) continue; // outside view
+          }
         }
         if (geom.type === 'Point') {
           const [lon, lat] = geom.coordinates;
@@ -846,10 +872,12 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
   const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
   // attach observer center so server can cull far-side features
   try {
-    const centerLatLon = getSubSatelliteLatLon();
-    if (centerLatLon && typeof centerLatLon.lat === 'number') {
-      qs.set('observer_lat', String(centerLatLon.lat));
-      qs.set('observer_lon', String(centerLatLon.lon));
+    if (observerCullingEnabled) {
+      const centerLatLon = getSubSatelliteLatLon();
+      if (centerLatLon && typeof centerLatLon.lat === 'number') {
+        qs.set('observer_lat', String(centerLatLon.lat));
+        qs.set('observer_lon', String(centerLatLon.lon));
+      }
     }
   } catch (e) {}
   let res;
@@ -958,8 +986,11 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
         if (repLat !== null && repLon !== null) {
           const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.005);
           const toPoint = worldPos.clone().sub(camera.position).normalize();
-          if (toPoint.dot(camDir) <= 0) continue;
-          if (!frustum.containsPoint(worldPos)) continue;
+          // Only apply these visibility checks when observer culling is enabled.
+          if (observerCullingEnabled) {
+            if (toPoint.dot(camDir) <= 0) continue;
+            if (!frustum.containsPoint(worldPos)) continue;
+          }
         }
         if (geom.type === 'Point') {
           const [lon, lat] = geom.coordinates;
