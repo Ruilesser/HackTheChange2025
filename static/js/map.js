@@ -730,17 +730,19 @@ document.getElementById('locate-me').addEventListener('click', () => {
       .then(osmData => processOsmJson(JSON.stringify(osmData)))
       .then(processedElements => {
         for (const el of processedElements) {
+          // CORRECT ORDER: lat, lon, imageUrl, elevation
           addIconMarker(
             el.centroid.lat,
             el.centroid.lon,
-            el.base_elev + (el.effective_height || 0.08),
-            el.icon || '/icons/default.svg'
+            el.icon || '/static/icons/default.svg',
+            (el.effective_height || 0) * 0.0001 // Small elevation offset
           );
         }
+        console.log(`Added ${processedElements.length} icon markers`);
       })
       .catch(err => {
-        console.error(err);
-        setStatus('Error processing OSM data', 'error', 5000);
+        console.error('Error processing OSM data for icons:', err);
+        setStatus('Error loading OSM icons', 'error', 5000);
       });
 
   }, (err) => {
@@ -860,6 +862,10 @@ animate();
 // bbox format: minlat,minlon,maxlat,maxlon
 fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 0.2 });
 
+/* TEST ICONS WORK, uncomment this if you want to see test values
+setTimeout(() => {
+    testIconPlacement();
+}, 2000); */
 
 // -----------------------------------------------------------
 // Utilities
@@ -1019,6 +1025,35 @@ async function processElement(element, iconMap) {
     };
 }
 
+// Test function to verify icons are working
+function testIconPlacement() {
+  // Clear existing icons
+  clearIconMarkers();
+  
+  // Add test icons at known locations
+  const testLocations = [
+    { lat: 40.7128, lon: -74.0060, name: "New York" },
+    { lat: 51.5074, lon: -0.1278, name: "London" },
+    { lat: 35.6762, lon: 139.6503, name: "Tokyo" },
+    { lat: -33.8688, lon: 151.2093, name: "Sydney" }
+  ];
+  
+  testLocations.forEach(location => {
+    addIconMarker(
+      location.lat,
+      location.lon,
+      '/static/icons/default.svg', // Make sure this icon exists
+      0.02
+    );
+  });
+  
+  console.log('Test icons placed at known locations');
+  setStatus('Test icons placed - check console for errors', 'info', 5000);
+}
+
+// Call this to test icon placement
+// testIconPlacement();
+
 // -----------------------------------------------------------
 // Main entry point
 // -----------------------------------------------------------
@@ -1094,127 +1129,157 @@ async function loadOsmFeaturesAt(lat, lon, radius = 500) {
 
 let iconMarkers = [];
 
-function addIconMarker(lat, lon, elevation, imageUrl) {
-  const EARTH_RADIUS = 6371000; // meters
+function addIconMarker(lat, lon, imageUrl, elevation) {
+  // Use the same coordinate system as your globe (radius = 1)
+  const radius = (modelScaledRadius || RADIUS) + 0.02; // Slightly above surface + elevation offset
+  
+  // Use your existing latLonToVector3 function for consistency
+  const position = latLonToVector3(lat, lon, radius);
+  console.log(`Loading icon from: ${imageUrl}`);
+  console.log(`Full URL would be: ${new URL(imageUrl, window.location.origin).href}`);
+  
+  // Create a sprite for the icon with proper error handling
+  const textureLoader = new THREE.TextureLoader();
+  textureLoader.load(
+    imageUrl,
+    (texture) => {
+      const material = new THREE.SpriteMaterial({ 
+        map: texture, 
+        transparent: true,
+        depthTest: true,
+        depthWrite: false
+      });
+      const sprite = new THREE.Sprite(material);
 
-  // Convert lat/lon/elev → XYZ
-  const radius = EARTH_RADIUS + elevation;
-  const phi = (90 - lat) * (Math.PI / 180);
-  const theta = (lon + 180) * (Math.PI / 180);
+      // Much smaller scale - adjust based on your needs
+      const scale = 0.05; // Experiment with this value
+      sprite.scale.set(scale, scale, 1);
+      sprite.position.copy(position);
+      
+      // Ensure icons render above other geometry
+      sprite.renderOrder = 1;
+      
+      scene.add(sprite);
+      iconMarkers.push(sprite);
+      console.log(`Icon placed at (${lat}, ${lon})`);
+    },
+    undefined, // onProgress callback
+    (err) => {
+      console.error('Failed to load icon:', imageUrl, err);
+      // Create a fallback sphere marker
+      createFallbackMarker(position);
+    }
+  );
+}
 
-  const x = radius * Math.sin(phi) * Math.cos(theta);
-  const y = radius * Math.cos(phi);
-  const z = radius * Math.sin(phi) * Math.sin(theta);
-
-  // Create a sprite for the icon
-  const texture = new THREE.TextureLoader().load(imageUrl);
-  const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
-  const sprite = new THREE.Sprite(material);
-
-  // Scale & position
-  sprite.scale.set(10000, 10000, 1);
-  sprite.position.set(x, y, z);
-
-  scene.add(sprite);
-  iconMarkers.push(sprite);
-  return sprite;
+// Fallback marker for missing icons
+function createFallbackMarker(position) {
+  const geometry = new THREE.SphereGeometry(0.01, 8, 8);
+  const material = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+  const marker = new THREE.Mesh(geometry, material);
+  marker.position.copy(position);
+  scene.add(marker);
+  iconMarkers.push(marker);
 }
 
 function clearIconMarkers() {
   for (const marker of iconMarkers) {
     scene.remove(marker);
-    marker.geometry?.dispose(); // clean up geometry if needed
-    marker.material?.dispose(); // clean up material if needed
+    if (marker.geometry) marker.geometry.dispose();
+    if (marker.material) {
+      if (marker.material.map) marker.material.map.dispose();
+      marker.material.dispose();
+    }
   }
-  iconMarkers = []; // reset the array
+  iconMarkers = [];
 }
 
 
 const ICON_MAP = {
     "amenity": { 
-        "bar": "icons/amenity_recreational.svg",
-        "bbq": "icons/amenity_recreational.svg",
-        "brothel": "icons/amenity_recreational.svg",
-        "cafe": "icons/amenity_recreational.svg",
-        "cinema": "icons/amenity_recreational.svg",
-        "food_court": "icons/amenity_recreational.svg",
-        "marketplace": "icons/amenity_recreational.svg",
-        "nightclub": "icons/amenity_recreational.svg",
-        "restaurant": "icons/amenity_recreational.svg",
-        "swinger_club": "icons/amenity_recreational.svg",
-        "theatre": "icons/amenity_recreational.svg",
-        "vending_machine": "icons/amenity_recreational.svg",
-        "bicycle_parking": "icons/amenity_vehicle.svg",
-        "bicycle_rental": "icons/amenity_vehicle.svg",
-        "car_rental": "icons/amenity_vehicle.svg",
-        "car_sharing": "icons/amenity_vehicle.svg",
-        "fuel": "icons/amenity_vehicle.svg",
-        "parking": "icons/amenity_vehicle.svg",
-        "charging_station": "icons/amenity_charging_station.svg",
-        "clinic": "icons/health.svg",
-        "dentist": "icons/health.svg",
-        "doctors": "icons/health.svg",
-        "hospital": "icons/health.svg",
-        "pharmacy": "icons/health.svg",
-        "college": "icons/amenity_education.svg",
-        "kindergarten": "icons/amenity_education.svg",
-        "school": "icons/amenity_education.svg",
-        "courthouse": "icons/amenity_public_building.svg",
-        "fire_station": "icons/emergency_fire_station.svg",
-        "police": "icons/emergency_police.svg",
-        "ferry_terminal": "icons/amenity_ferry_terminal.svg",
-        "grave_yard": "icons/amenity_grave_yard.svg",
-        "library": "icons/amenity_library.svg",
-        "place_of_worship": "icons/amenity_place_of_worship.svg",
-        "post_box": "icons/amenity_post.svg",
-        "post_office": "icons/amenity_post.svg",
-        "prison": "icons/amenity_prison.svg",
-        "public_building": "icons/amenity_public_building.svg",
-        "recycling": "icons/amenity_recycling.svg",
-        "shelter": "icons/amenity_shelter.svg",
-        "taxi": "icons/amenity_taxi.svg",
-        "telephone": "icons/amenity_telephone.svg",
-        "toilets": "icons/amenity_toilets.svg",
-        "townhall": "icons/amenity_public_building.svg",
-        "drinking_water": "icons/water.svg",
-        "water_point": "icons/water.svg",
-        "_default": "icons/amenity.svg"
+        "bar": "/static/icons/amenity_recreational.svg",
+        "bbq": "/static/icons/amenity_recreational.svg",
+        "brothel": "/static/icons/amenity_recreational.svg",
+        "cafe": "/static/icons/amenity_recreational.svg",
+        "cinema": "/static/icons/amenity_recreational.svg",
+        "food_court": "/static/icons/amenity_recreational.svg",
+        "marketplace": "/static/icons/amenity_recreational.svg",
+        "nightclub": "/static/icons/amenity_recreational.svg",
+        "restaurant": "/static/icons/amenity_recreational.svg",
+        "swinger_club": "/static/icons/amenity_recreational.svg",
+        "theatre": "/static/icons/amenity_recreational.svg",
+        "vending_machine": "/static/icons/amenity_recreational.svg",
+        "bicycle_parking": "/static/icons/amenity_vehicle.svg",
+        "bicycle_rental": "/static/icons/amenity_vehicle.svg",
+        "car_rental": "/static/icons/amenity_vehicle.svg",
+        "car_sharing": "/static/icons/amenity_vehicle.svg",
+        "fuel": "/static/icons/amenity_vehicle.svg",
+        "parking": "/static/icons/amenity_vehicle.svg",
+        "charging_station": "/static/icons/amenity_charging_station.svg",
+        "clinic": "/static/icons/health.svg",
+        "dentist": "/static/icons/health.svg",
+        "doctors": "/static/icons/health.svg",
+        "hospital": "/static/icons/health.svg",
+        "pharmacy": "/static/icons/health.svg",
+        "college": "/static/icons/amenity_education.svg",
+        "kindergarten": "/static/icons/amenity_education.svg",
+        "school": "/static/icons/amenity_education.svg",
+        "courthouse": "/static/icons/amenity_public_building.svg",
+        "fire_station": "/static/icons/emergency_fire_station.svg",
+        "police": "/static/icons/emergency_police.svg",
+        "ferry_terminal": "/static/icons/amenity_ferry_terminal.svg",
+        "grave_yard": "/static/icons/amenity_grave_yard.svg",
+        "library": "/static/icons/amenity_library.svg",
+        "place_of_worship": "/static/icons/amenity_place_of_worship.svg",
+        "post_box": "/static/icons/amenity_post.svg",
+        "post_office": "/static/icons/amenity_post.svg",
+        "prison": "/static/icons/amenity_prison.svg",
+        "public_building": "/static/icons/amenity_public_building.svg",
+        "recycling": "/static/icons/amenity_recycling.svg",
+        "shelter": "/static/icons/amenity_shelter.svg",
+        "taxi": "/static/icons/amenity_taxi.svg",
+        "telephone": "/static/icons/amenity_telephone.svg",
+        "toilets": "/static/icons/amenity_toilets.svg",
+        "townhall": "/static/icons/amenity_public_building.svg",
+        "drinking_water": "/static/icons/water.svg",
+        "water_point": "/static/icons/water.svg",
+        "_default": "/static/icons/amenity.svg"
     },
-    "natural": { "_default": "icons/natural.svg" },
+    "natural": { "_default": "/static/icons/natural.svg" },
     "emergency": {
-        "ambulance_station": "icons/emergency_ambulance_station.svg",
-        "fire_station": "icons/emergency_fire_station.svg",
-        "lifeguard_station": "icons/emergency_lifeguard_station.svg",
-        "police": "icons/emergency_police.svg",
-        "first_aid": "icons/emergency_first_aid.svg",
-        "defibrillator": "icons/emergency_first_aid.svg",
-        "assembly_point": "icons/emergency_assembly_point.svg",
-        "_default": "icons/emergency.svg"
+        "ambulance_station": "/static/icons/emergency_ambulance_station.svg",
+        "fire_station": "/static/icons/emergency_fire_station.svg",
+        "lifeguard_station": "/static/icons/emergency_lifeguard_station.svg",
+        "police": "/static/icons/emergency_police.svg",
+        "first_aid": "/static/icons/emergency_first_aid.svg",
+        "defibrillator": "/static/icons/emergency_first_aid.svg",
+        "assembly_point": "/static/icons/emergency_assembly_point.svg",
+        "_default": "/static/icons/emergency.svg"
     },
-    "aerialway":   { "_default": "icons/aerialway.svg" },
-    "aeroway":     { "_default": "icons/aerialway.svg" },
-    "barrier":     { "_default": "icons/barrier.svg" },
-    "boundary":    { "_default": "icons/barrier.svg" },
-    "building":    { "_default": "icons/building.svg" },
-    "craft":       { "_default": "icons/craft.svg" },
-    "geological":  { "_default": "icons/geological.svg" },
-    "healthcare":  { "_default": "icons/health.svg" },
-    "highway":     { "_default": "icons/highway.svg" },
-    "historic":    { "_default": "icons/historic.svg" },
-    "landuse":     { "_default": "icons/landuse.svg" },
-    "leisure":     { "_default": "icons/leisure.svg" },
-    "man_made":    { "_default": "icons/man_made.svg" },
-    "military":    { "_default": "icons/military.svg" },
-    "office":      { "_default": "icons/office.svg" },
-    "place":       { "_default": "icons/place.svg" },
-    "power":       { "_default": "icons/power.svg" },
-    "public_transport": { "_default": "icons/public_transport.svg" },
-    "railway":     { "_default": "icons/route.svg" },
-    "route":       { "_default": "icons/route.svg" },
-    "shop":        { "_default": "icons/shop.svg" },
-    "telecom":     { "_default": "icons/telecom.svg" },
-    "tourism":     { "_default": "icons/tourism.svg" },
-    "water":       { "_default": "icons/water.svg" },
-    "waterway":    { "_default": "icons/water.svg" },
-    "_global_default": { "_default": "icons/default.svg" }
+    "aerialway":   { "_default": "/static/icons/aerialway.svg" },
+    "aeroway":     { "_default": "/static/icons/aerialway.svg" },
+    "barrier":     { "_default": "/static/icons/barrier.svg" },
+    "boundary":    { "_default": "/static/icons/barrier.svg" },
+    "building":    { "_default": "/static/icons/building.svg" },
+    "craft":       { "_default": "/static/icons/craft.svg" },
+    "geological":  { "_default": "/static/icons/geological.svg" },
+    "healthcare":  { "_default": "/static/icons/health.svg" },
+    "highway":     { "_default": "/static/icons/highway.svg" },
+    "historic":    { "_default": "/static/icons/historic.svg" },
+    "landuse":     { "_default": "/static/icons/landuse.svg" },
+    "leisure":     { "_default": "/static/icons/leisure.svg" },
+    "man_made":    { "_default": "/static/icons/man_made.svg" },
+    "military":    { "_default": "/static/icons/military.svg" },
+    "office":      { "_default": "/static/icons/office.svg" },
+    "place":       { "_default": "/static/icons/place.svg" },
+    "power":       { "_default": "/static/icons/power.svg" },
+    "public_transport": { "_default": "/static/icons/public_transport.svg" },
+    "railway":     { "_default": "/static/icons/route.svg" },
+    "route":       { "_default": "/static/icons/route.svg" },
+    "shop":        { "_default": "/static/icons/shop.svg" },
+    "telecom":     { "_default": "/static/icons/telecom.svg" },
+    "tourism":     { "_default": "/static/icons/tourism.svg" },
+    "water":       { "_default": "/static/icons/water.svg" },
+    "waterway":    { "_default": "/static/icons/water.svg" },
+    "_global_default": { "_default": "/static/icons/default.svg" }
 };
