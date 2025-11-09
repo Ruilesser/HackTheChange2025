@@ -58,7 +58,9 @@ scene.add(featureLines);
 scene.add(countryBorders);
 
 // Sprite-based labels (Three.js) for performance and consistent scaling
-const spriteLabels = []; // array of { sprite, worldPos: Vector3, priority }
+const spriteLabels = []; // array of sprites
+// index to deduplicate labels by name or centroid key -> sprite
+const spriteLabelIndex = new Map();
 
 // Clear only OSM feature layers (keep country borders and labels intact)
 function clearFeatures() {
@@ -78,6 +80,7 @@ function clearAllFeatures() {
     if (s.material) s.material.dispose();
   }
   spriteLabels.length = 0;
+  spriteLabelIndex.clear();
 }
 
 function renderPoint(lat, lon, color = 0xff3333, size = 0.02) {
@@ -306,6 +309,29 @@ function roundRect(ctx, x, y, w, h, r) {
 }
 
 function addCountryLabelSprite(name, lat, lon, priority = 0) {
+  // use name as primary key for deduplication; fallback to centroid key
+  const keyName = (name || '').trim();
+  const centroidKey = (lat !== null && lon !== null) ? `${lat.toFixed(6)},${lon.toFixed(6)}` : null;
+  const key = keyName || centroidKey;
+  if (!key) return; // can't create label without identifier
+
+  // If we already have a label with this key, keep the higher-priority one
+  if (spriteLabelIndex.has(key)) {
+    const existing = spriteLabelIndex.get(key);
+    const existingPriority = existing.userData.priority || 0;
+    if ((priority || 0) <= existingPriority) {
+      // existing is equal or better, skip
+      return;
+    }
+    // new label has higher priority: remove existing and replace
+    try { scene.remove(existing); } catch (e) {}
+    if (existing.material && existing.material.map) existing.material.map.dispose();
+    if (existing.material) existing.material.dispose();
+    const idx = spriteLabels.indexOf(existing);
+    if (idx >= 0) spriteLabels.splice(idx, 1);
+    spriteLabelIndex.delete(key);
+  }
+
   const sprite = createLabelSprite(name);
   const worldPos = latLonToVector3(lat, lon, (modelScaledRadius || RADIUS) + 0.01);
   sprite.position.copy(worldPos);
@@ -315,6 +341,7 @@ function addCountryLabelSprite(name, lat, lon, priority = 0) {
   sprite.scale.set(0.4, 0.14, 1);
   scene.add(sprite);
   spriteLabels.push(sprite);
+  spriteLabelIndex.set(key, sprite);
 }
 
 // update sprite label visibility and approximate collision avoidance
