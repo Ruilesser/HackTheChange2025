@@ -92,6 +92,19 @@ def map_view():
     # page that renders a Three.js globe and allows markers over the earth
     return render_template('map.html')
 
+import google.generativeai as genai
+
+app = Flask(__name__)
+genai.configure(api_key="YOUR_API_KEY")
+model = genai.GenerativeModel("gemini-pro")
+
+@app.route('/ask-gemini', methods=['POST'])
+def ask_gemini():
+    prompt = request.json.get('prompt')
+    response = model.generate_content(prompt)
+    return jsonify({'response': response.text})
+
+# ...existing code...
 
 @app.route('/api/overpass')
 def api_overpass():
