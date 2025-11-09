@@ -1,13 +1,252 @@
 from flask import Flask, render_template, request, jsonify, Response
-import requests
-import math
-from functools import lru_cache
 import time
-import json
 import os
+import json
+import math
+import logging
+import requests
+import traceback
+from functools import lru_cache
+import urllib  # or: from urllib import parse as urllib_parse
+from shapely.geometry import shape, Point
 
 app = Flask(__name__)
 
+# --- Overpass tuning constants ---
+OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter"
+TILE_DEG = 0.01                 # smaller tile size (deg). Lower -> more tiles, fewer elements per tile
+MAX_ELEMENTS_PER_TILE = 3000    # threshold to subdivide tile (safe lower than your prior 5000)
+MAX_RETRIES = 5                 # increased retries
+BACKOFF_BASE = 1.5              # exponential backoff multiplier
+REQUEST_TIMEOUT = 45            # increased timeout (seconds per Overpass request)
+DEFAULT_TAG_FILTERS = ['["building"]']  # restrict to building while debugging dense areas
+
+logger = logging.getLogger(__name__)
+
+def clamp_lat(lat):
+    try:
+        lat = float(lat)
+        return max(-90.0, min(90.0, lat))
+    except Exception:
+        return None
+
+def clamp_lon(lon):
+    try:
+        lon = float(lon)
+        # normalize into [-180,180)
+        return ((lon + 180.0) % 360.0) - 180.0
+    except Exception:
+        return None
+
+def format_coord(v):
+    return f"{float(v):.8f}"
+
+def normalize_and_split_bbox(minlat, minlon, maxlat, maxlon):
+    """
+    Validate/clamp coords and return a list of valid bbox tuples.
+    Splits across the antimeridian if needed.
+    Returns empty list if bbox is invalid or too small.
+    """
+    try:
+        a = clamp_lat(minlat); b = clamp_lon(minlon)
+        c = clamp_lat(maxlat); d = clamp_lon(maxlon)
+        if a is None or b is None or c is None or d is None:
+            return []
+        # ensure min <= max in latitude; if reversed swap
+        if a > c:
+            a, c = c, a
+        # if lat range too small, skip
+        if abs(c - a) < 1e-7:
+            return []
+        # handle antimeridian: if lon range crosses 180/-180 boundary
+        if b <= d:
+            if abs(d - b) < 1e-7:
+                return []
+            return [(a, b, c, d)]
+        else:
+            # split into two boxes: b..180 and -180..d
+            if (180.0 - b) >= 1e-7:
+                left = (a, b, c, 180.0)
+            else:
+                left = None
+            if (d + 180.0) >= 1e-7:
+                right = (a, -180.0, c, d)
+            else:
+                right = None
+            out = []
+            if left: out.append(left)
+            if right: out.append(right)
+            return out
+    except Exception:
+        return []
+
+def build_overpass_query_for_bbox(minlat, minlon, maxlat, maxlon, tag_filters=None):
+    """Build Overpass QL with validated/split/ formatted coords."""
+    bboxes = normalize_and_split_bbox(minlat, minlon, maxlat, maxlon)
+    if not bboxes:
+        raise ValueError("invalid bbox")
+    # treat empty list as not-provided -> fall back to defaults
+    filters = tag_filters if (tag_filters is not None and len(tag_filters) > 0) else DEFAULT_TAG_FILTERS
+
+    # Build a single combined body by joining each bbox's selection with semicolons.
+    # Each bbox contributes "node[tag](area);way[tag](area);relation[tag](area);"
+    selection_parts = []
+    for (a, b, c, d) in bboxes:
+        area = f"({format_coord(a)},{format_coord(b)},{format_coord(c)},{format_coord(d)})"
+        for t in filters:
+            selection_parts.append(f'node{t}{area};')
+            selection_parts.append(f'way{t}{area};')
+            selection_parts.append(f'relation{t}{area};')
+
+    # defensive: ensure we actually built something
+    if not selection_parts:
+        raise ValueError("No selection parts generated for Overpass query (empty tag filters?)")
+
+    # join into one group and wrap once
+    query_body = "".join(selection_parts)
+    q = f"[out:json][timeout:{REQUEST_TIMEOUT}];({query_body})(._;>;);out geom;"
+    return q
+
+def normalize_lon(lon):
+    """Normalize longitude into range [-180, 180)."""
+    try:
+        return ((float(lon) + 180.0) % 360.0) - 180.0
+    except Exception:
+        return lon
+
+# improve fetch_overpass_with_retries to surface response text on HTTP errors
+def fetch_overpass_with_retries(query, max_retries=MAX_RETRIES):
+    """POST to Overpass with retries and exponential backoff. Returns parsed JSON or raises."""
+    attempt = 0
+    backoff = 1.0
+    while True:
+        try:
+            # debug log query preview
+            app.logger.debug("Overpass query preview: %s", (query[:800] + '...') if isinstance(query, str) and len(query) > 800 else query)
+            resp = requests.post(OVERPASS_ENDPOINT, data={'data': query}, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.HTTPError as he:
+            # include response body for diagnostics
+            body = ''
+            try:
+                body = resp.text
+            except Exception:
+                body = str(he)
+            attempt += 1
+            logger.warning("Overpass HTTP error (attempt %d/%d): %s -- %s", attempt, max_retries, he, body[:400])
+            if attempt >= max_retries:
+                raise RuntimeError(f"Overpass HTTP error: {he} -- {body}") from he
+            time.sleep(backoff)
+            backoff *= BACKOFF_BASE
+        except Exception as e:
+            attempt += 1
+            logger.warning("Overpass request failed (attempt %d/%d): %s", attempt, max_retries, str(e))
+            if attempt >= max_retries:
+                raise
+            time.sleep(backoff)
+            backoff *= BACKOFF_BASE
+
+def subdivide_bbox(minlat, minlon, maxlat, maxlon):
+    """Split bbox into 4 quads and return list of bboxes."""
+    midlat = (minlat + maxlat) / 2.0
+    midlon = (minlon + maxlon) / 2.0
+    return [
+        (minlat, minlon, midlat, midlon),
+        (minlat, midlon, midlat, maxlon),
+        (midlat, minlon, maxlat, midlon),
+        (midlat, midlon, maxlat, maxlon)
+    ]
+
+def elements_count_from_overpass_json(data):
+    try:
+        return len(data.get('elements', []))
+    except Exception:
+        return 0
+
+def stream_overpass_tiles(minlat, minlon, maxlat, maxlon, tag_filters=None, tile_deg=TILE_DEG):
+    """
+    Generator: iterates tiles covering bbox, validates each tile bbox and skips invalid/small tiles.
+    Query each tag/filter separately to avoid producing large/complex combined QL strings.
+    Uses a small cache (fetch_overpass_cached) to avoid re-requesting identical tiles.
+    """
+    # compute tile grid using floats
+    lat = float(minlat)
+    maxlat = float(maxlat)
+    minlon = float(minlon)
+    maxlon = float(maxlon)
+
+    # avoid degenerate global loops
+    if math.isnan(lat) or math.isnan(maxlat) or math.isnan(minlon) or math.isnan(maxlon):
+        return
+
+    # defensive: ensure we use a non-empty filter list
+    filters = tag_filters if (tag_filters and len(tag_filters) > 0) else DEFAULT_TAG_FILTERS
+
+    while lat < maxlat:
+        next_lat = min(lat + tile_deg, maxlat)
+        lon = minlon
+        while lon < maxlon:
+            next_lon = min(lon + tile_deg, maxlon)
+            # validate and skip invalid tiny tiles early
+            valid_boxes = normalize_and_split_bbox(lat, lon, next_lat, next_lon)
+            if not valid_boxes:
+                lon = next_lon
+                continue
+            for vb in valid_boxes:
+                (v_minlat, v_minlon, v_maxlat, v_maxlon) = vb
+                # Query each filter separately to avoid complex combined queries
+                for t in filters:
+                    # Build simple per-element-type queries (node / way / relation) to avoid complex grouping/parsing errors.
+                    area = f"({format_coord(v_minlat)},{format_coord(v_minlon)},{format_coord(v_maxlat)},{format_coord(v_maxlon)})"
+                    queries = [
+                        (f"node{t}{area};out geom;", "node"),
+                        (f"way{t}{area};(._;>;);out geom;", "way"),
+                        (f"relation{t}{area};(._;>;);out geom;", "relation"),
+                    ]
+                    for q_body, q_type in queries:
+                        q = f"[out:json][timeout:{REQUEST_TIMEOUT}];{q_body}"
+                        try:
+                            app.logger.debug("Overpass single-query preview (%s): %s", q_type, (q[:800] + '...') if isinstance(q, str) and len(q) > 800 else q)
+                            # Try cache first
+                            try:
+                                data = fetch_overpass_cached(q)
+                                app.logger.debug("Overpass cache hit for tile %s filter %s type %s", str(vb), str(t), q_type)
+                            except Exception as cache_exc:
+                                app.logger.debug("Overpass cache miss / error: %s", cache_exc)
+                                data = fetch_overpass_with_retries(q)
+                            count = elements_count_from_overpass_json(data)
+                            if count > MAX_ELEMENTS_PER_TILE:
+                                for sub in subdivide_bbox(v_minlat, v_minlon, v_maxlat, v_maxlon):
+                                    yield from stream_overpass_tiles(sub[0], sub[1], sub[2], sub[3], tag_filters=[t], tile_deg=tile_deg / 2.0)
+                            else:
+                                for el in data.get('elements', []):
+                                    if 'type' not in el or 'id' not in el:
+                                        continue
+                                    feat = {'type':'Feature', 'id': f"{el.get('type')}/{el.get('id')}", 'properties': el.get('tags') or {}}
+                                    if el.get('type') == 'node' and 'lat' in el and 'lon' in el:
+                                        feat['geometry'] = {'type':'Point', 'coordinates':[el['lon'], el['lat']]}
+                                    elif el.get('geometry'):
+                                        coords = [[pt['lon'], pt['lat']] for pt in el['geometry']]
+                                        feat['geometry'] = {'type':'LineString', 'coordinates': coords}
+                                    yield feat
+                        except ValueError as ve:
+                            app.logger.debug("Skipping invalid tile bbox %s: %s", str(vb), ve)
+                            yield {'_error': 'invalid_tile_bbox', 'bbox': list(vb)}
+                        except Exception as e:
+                            tb = traceback.format_exc()
+                            app.logger.error(
+                                "Overpass tile failed for bbox [%s] filter %s type %s: %s\nQuery preview: %s\nTraceback:\n%s",
+                                str(vb), str(t), q_type, str(e)[:400],
+                                (q[:1000] + '...') if (isinstance(q, str) and len(q) > 1000) else (q or ''),
+                                tb
+                            )
+                            preview = None
+                            if isinstance(q, str):
+                                preview = q[:800] + ('...' if len(q) > 800 else '')
+                            yield {'_error': str(e), 'bbox': list(vb), 'query_preview': preview}
+            lon = next_lon
+        lat = next_lat
 
 @app.route('/')
 def home():
@@ -37,391 +276,120 @@ def map_view():
 
 @app.route('/api/overpass')
 def api_overpass():
-    """Query Overpass API for elements tagged with 'reconstruction' or 'building'.
-
-    Query parameters (one of):
-      - bbox=minlat,minlon,maxlat,maxlon  (preferred)
-      - lat, lon, radius (meters) -> server computes bbox
-
-    Returns GeoJSON FeatureCollection with simple properties (tags).
     """
-    bbox = request.args.get('bbox')
-    lat = request.args.get('lat', type=float)
-    lon = request.args.get('lon', type=float)
-    radius = request.args.get('radius', type=float)  # meters
-
-    if not bbox and (lat is None or lon is None or radius is None):
-        return jsonify({"error": "Provide bbox or lat+lon+radius"}), 400
-
-    if not bbox:
-        # approximate degree offsets for radius (works for small radii)
-        lat_delta = radius / 111320.0
-        lon_delta = radius / (111320.0 * max(0.00001, abs(math.cos(math.radians(lat)))) )
-        minlat = lat - lat_delta
-        maxlat = lat + lat_delta
-        minlon = lon - lon_delta
-        maxlon = lon + lon_delta
-    else:
-        try:
-            parts = [float(p) for p in bbox.split(',')]
-            if len(parts) != 4:
-                raise ValueError()
-            minlat, minlon, maxlat, maxlon = parts
-        except Exception:
-            return jsonify({"error": "Invalid bbox format. Use minlat,minlon,maxlat,maxlon"}), 400
-
-    start_time = time.time()
-
-    bbox_str = f"{minlat},{minlon},{maxlat},{maxlon}"
-
-    overpass_q = f"""
-[out:json][timeout:25];
-(
-    node["reconstruction"]({bbox_str});
-    way["reconstruction"]({bbox_str});
-    relation["reconstruction"]({bbox_str});
-    node["building"]({bbox_str});
-    way["building"]({bbox_str});
-    relation["building"]({bbox_str});
-);
-(._;>;);
-out geom;
-"""
-    # server-side cache to avoid repeated heavy Overpass queries
-    try:
-        data = fetch_overpass_cached(overpass_q)
-    except Exception as e:
-        return jsonify({"error": "Overpass request failed", "details": str(e)}), 502
-
-    # basic protection: avoid returning extremely large payloads
-    elems = data.get('elements', [])
-    if len(elems) > 5000:
-        return jsonify({"error": "Too many elements in area. Reduce bbox or radius."}), 413
-
-    # Build lookup maps for nodes, ways and relations
-    nodes = {}
-    ways = {}
-    relations = []
-    for el in elems:
-        t = el.get('type')
-        if t == 'node':
-            nid = el.get('id')
-            latn = el.get('lat')
-            lonn = el.get('lon')
-            if latn is None or lonn is None:
-                continue
-            nodes[nid] = (latn, lonn)
-        elif t == 'way':
-            wid = el.get('id')
-            geom = el.get('geometry')
-            if not geom:
-                # sometimes ways don't have geometry, skip
-                continue
-            coords = [[p['lon'], p['lat']] for p in geom]
-            ways[wid] = coords
-        elif t == 'relation':
-            relations.append(el)
-
-    # Use Shapely to assemble multipolygons more robustly
-    try:
-        from shapely.geometry import LineString, Polygon, Point, MultiLineString
-        from shapely.ops import linemerge, polygonize, unary_union
-    except Exception as e:
-        # Shapely not available -> fallback to simple assembly
-        app.logger.warning('Shapely not available, falling back to simple assembly: %s', e)
-        features = []
-        used_way_ids = set()
-        for wid, coords in ways.items():
-            if len(coords) >= 4 and coords[0] == coords[-1]:
-                feat = {"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [coords]}, "properties": {}}
-            else:
-                feat = {"type": "Feature", "geometry": {"type": "LineString", "coordinates": coords}, "properties": {}}
-            features.append(feat)
-        for nid, (latn, lonn) in nodes.items():
-            feat = {"type": "Feature", "geometry": {"type": "Point", "coordinates": [lonn, latn]}, "properties": {}}
-            features.append(feat)
-        geojson = {"type": "FeatureCollection", "features": features}
-        return jsonify(geojson)
-
-    features = []
-    used_way_ids = set()
-
-    # Process relations first: build polygons using polygonize from merged way segments
-    for rel in relations:
-        tags = rel.get('tags', {}) or {}
-        members = rel.get('members', []) or []
-        outer_lines = []
-        inner_lines = []
-        for m in members:
-            if m.get('type') == 'way':
-                ref = m.get('ref')
-                role = m.get('role') or ''
-                coords = ways.get(ref)
-                if coords:
-                    # Convert way coords to shapely LineString (lon,lat)
-                    try:
-                        ls = LineString(coords)
-                        if not ls.is_empty:
-                            if role == 'inner':
-                                inner_lines.append(ls)
-                            else:
-                                outer_lines.append(ls)
-                    except Exception:
-                        continue
-                    used_way_ids.add(ref)
-
-        if not outer_lines:
-            continue
-
-        try:
-            merged = linemerge(outer_lines) if len(outer_lines) > 1 else outer_lines[0]
-            # polygonize returns polygons formed by the lines
-            polys = list(polygonize(merged))
-            # if no polygons found, try unioning lines and polygonize
-            if not polys:
-                unioned = unary_union(outer_lines)
-                polys = list(polygonize(unioned))
-        except Exception:
-            polys = []
-
-        # Map inner lines to holes by finding containing polygon
-        inner_rings = [list(ls.coords) for ls in inner_lines]
-        for poly in polys:
-            holes = []
-            for ring in inner_rings:
-                try:
-                    ring_poly = Polygon(ring)
-                    if poly.contains(ring_poly.representative_point()):
-                        holes.append(ring)
-                except Exception:
-                    continue
-            exterior = list(poly.exterior.coords)
-            hole_coords = [list(r) for r in holes]
-            # build geojson polygon coordinates (list of rings)
-            coords = [ [[float(x), float(y)] for x,y in exterior] ]
-            for h in hole_coords:
-                coords.append([[float(x), float(y)] for x,y in h])
-            features.append({"type": "Feature", "geometry": {"type": "Polygon", "coordinates": coords}, "properties": tags})
-
-    # add standalone ways (not part of relations)
-    for wid, coords in ways.items():
-        if wid in used_way_ids:
-            continue
-        try:
-            if len(coords) >= 4 and coords[0] == coords[-1]:
-                poly = Polygon(coords)
-                if not poly.is_empty:
-                    features.append({"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [ [[float(x), float(y)] for x,y in poly.exterior.coords] ]}, "properties": {}})
-                    continue
-            # fallback: line
-            features.append({"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[float(x), float(y)] for x,y in coords]}, "properties": {}})
-        except Exception:
-            continue
-
-    # add nodes not part of ways
-    node_coords_in_ways = set()
-    for coords in ways.values():
-        for lon, lat in coords:
-            node_coords_in_ways.add((lat, lon))
-    for nid, (latn, lonn) in nodes.items():
-        if (latn, lonn) in node_coords_in_ways:
-            continue
-        features.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [float(lonn), float(latn)]}, "properties": {}})
-
-    geojson = {"type": "FeatureCollection", "features": features}
-    elapsed = time.time() - start_time
-    app.logger.debug(f"Overpass query time: {elapsed:.2f}s, features: {len(features)}")
-    return jsonify(geojson)
-
-
-@app.route('/api/overpass_stream')
-def api_overpass_stream():
-    """Stream Overpass results as NDJSON by tiling the requested bbox.
-
-    Query params: same as /api/overpass (bbox or lat+lon+radius)
-    Returns newline-delimited GeoJSON Feature objects as they are produced.
+    Synchronous Overpass endpoint. Accepts either bbox=minlat,minlon,maxlat,maxlon
+    or lat/lon/radius (meters). Optional tags param (comma-separated keys) to restrict results.
     """
     bbox = request.args.get('bbox')
     lat = request.args.get('lat', type=float)
     lon = request.args.get('lon', type=float)
     radius = request.args.get('radius', type=float)
+    tags_param = request.args.get('tags')  # e.g. "building,amenity"
+    tag_filters = None
+    if tags_param:
+        parts = [p.strip() for p in tags_param.split(',') if p.strip()]
+        tag_filters = [f'["{p}"]' for p in parts] if parts else None
 
-    if not bbox and (lat is None or lon is None or radius is None):
-        return jsonify({"error": "Provide bbox or lat+lon+radius"}), 400
-
-    if not bbox:
+    if bbox:
+        try:
+            minlat, minlon, maxlat, maxlon = [float(x) for x in bbox.split(',')]
+        except Exception:
+            return jsonify({'error':'invalid bbox'}), 400
+    elif lat is not None and lon is not None and radius is not None:
+        # convert radius to degree bbox (approx)
         lat_delta = radius / 111320.0
-        lon_delta = radius / (111320.0 * max(0.00001, abs(math.cos(math.radians(lat)))) )
-        minlat = lat - lat_delta
-        maxlat = lat + lat_delta
-        minlon = lon - lon_delta
-        maxlon = lon + lon_delta
+        lon_delta = radius / (111320.0 * max(1e-6, abs(math.cos(math.radians(lat)))))
+        minlat, maxlat = lat - lat_delta, lat + lat_delta
+        minlon, maxlon = lon - lon_delta, lon + lon_delta
     else:
+        return jsonify({'error':'provide bbox or lat+lon+radius'}), 400
+
+    # Normalize longitudes into [-180,180]
+    minlon = normalize_lon(minlon)
+    maxlon = normalize_lon(maxlon)
+
+    # If bbox crosses the antimeridian after normalization (minlon > maxlon),
+    # split into two queries and merge results.
+    bboxes = []
+    if minlon <= maxlon:
+        bboxes.append((minlat, minlon, maxlat, maxlon))
+    else:
+        # split into two: [minlon..180] and [-180..maxlon]
+        bboxes.append((minlat, minlon, maxlat, 180.0))
+        bboxes.append((minlat, -180.0, maxlat, maxlon))
+
+    features = []
+    try:
+        for (mlat, mlon, xlat, xlon) in bboxes:
+            q = build_overpass_query_for_bbox(mlat, mlon, xlat, xlon, tag_filters=tag_filters)
+            data = fetch_overpass_with_retries(q)
+            for el in data.get('elements', []):
+                feat = {'type':'Feature', 'id': f"{el.get('type')}/{el.get('id')}", 'properties': el.get('tags') or {}}
+                if el.get('type') == 'node' and 'lat' in el and 'lon' in el:
+                    feat['geometry'] = {'type':'Point', 'coordinates':[el['lon'], el['lat']]}
+                elif el.get('geometry'):
+                    coords = [[pt['lon'], pt['lat']] for pt in el['geometry']]
+                    feat['geometry'] = {'type':'LineString', 'coordinates': coords}
+                features.append(feat)
+        return jsonify({'type':'FeatureCollection','features':features})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 502
+
+@app.route('/api/overpass_stream')
+def api_overpass_stream():
+    """
+    Streaming NDJSON Overpass endpoint that tiles the requested bbox and streams features.
+    Query params:
+      - bbox or lat/lon/radius
+      - tags (optional comma-separated tag keys, e.g. tags=building,amenity)
+      - tile_deg (optional override)
+    """
+    bbox = request.args.get('bbox')
+    lat = request.args.get('lat', type=float)
+    lon = request.args.get('lon', type=float)
+    radius = request.args.get('radius', type=float)
+    tags_param = request.args.get('tags')
+    tile_deg = request.args.get('tile_deg', type=float) or TILE_DEG
+
+    tag_filters = None
+    if tags_param:
+        parts = [p.strip() for p in tags_param.split(',') if p.strip()]
+        tag_filters = [f'["{p}"]' for p in parts] if parts else None
+
+    if bbox:
         try:
-            parts = [float(p) for p in bbox.split(',')]
-            if len(parts) != 4:
-                raise ValueError()
-            minlat, minlon, maxlat, maxlon = parts
+            minlat, minlon, maxlat, maxlon = [float(x) for x in bbox.split(',')]
         except Exception:
-            return jsonify({"error": "Invalid bbox format. Use minlat,minlon,maxlat,maxlon"}), 400
+            return jsonify({'_error':'invalid bbox'}), 400
+    elif lat is not None and lon is not None and radius is not None:
+        lat_delta = radius / 111320.0
+        lon_delta = radius / (111320.0 * max(1e-6, abs(math.cos(math.radians(lat)))))
+        minlat, maxlat = lat - lat_delta, lat + lat_delta
+        minlon, maxlon = lon - lon_delta, lon + lon_delta
+    else:
+        return jsonify({'_error':'provide bbox or lat+lon+radius'}), 400
 
-    # tiling parameters
-    lat_span = maxlat - minlat
-    lon_span = maxlon - minlon
-    tile_deg = 0.02
-    nx = min(8, max(1, int(math.ceil(lon_span / tile_deg))))
-    ny = min(8, max(1, int(math.ceil(lat_span / tile_deg))))
+    # Normalize longitudes
+    minlon = normalize_lon(minlon)
+    maxlon = normalize_lon(maxlon)
 
-    def assemble_features_from_elements(elems):
-        nodes = {}
-        ways = {}
-        relations = []
-        for el in elems:
-            t = el.get('type')
-            if t == 'node':
-                nid = el.get('id')
-                latn = el.get('lat')
-                lonn = el.get('lon')
-                if latn is None or lonn is None:
-                    continue
-                nodes[nid] = (latn, lonn)
-            elif t == 'way':
-                wid = el.get('id')
-                geom = el.get('geometry')
-                if not geom:
-                    continue
-                coords = [[p['lon'], p['lat']] for p in geom]
-                ways[wid] = coords
-            elif t == 'relation':
-                relations.append(el)
-
-        try:
-            from shapely.geometry import LineString, Polygon
-            from shapely.ops import linemerge, polygonize, unary_union
-            use_shapely = True
-        except Exception:
-            use_shapely = False
-
-        features = []
-        if use_shapely:
-            used_way_ids = set()
-            for rel in relations:
-                tags = rel.get('tags', {}) or {}
-                members = rel.get('members', []) or []
-                outer_lines = []
-                inner_lines = []
-                for m in members:
-                    if m.get('type') == 'way':
-                        ref = m.get('ref')
-                        role = m.get('role') or ''
-                        coords = ways.get(ref)
-                        if coords:
-                            try:
-                                ls = LineString(coords)
-                                if not ls.is_empty:
-                                    if role == 'inner':
-                                        inner_lines.append(ls)
-                                    else:
-                                        outer_lines.append(ls)
-                            except Exception:
-                                continue
-                            used_way_ids.add(ref)
-
-                if not outer_lines:
-                    continue
-                try:
-                    merged = linemerge(outer_lines) if len(outer_lines) > 1 else outer_lines[0]
-                    polys = list(polygonize(merged))
-                    if not polys:
-                        unioned = unary_union(outer_lines)
-                        polys = list(polygonize(unioned))
-                except Exception:
-                    polys = []
-
-                inner_rings = [list(ls.coords) for ls in inner_lines]
-                for poly in polys:
-                    holes = []
-                    for ring in inner_rings:
-                        try:
-                            ring_poly = Polygon(ring)
-                            if poly.contains(ring_poly.representative_point()):
-                                holes.append(ring)
-                        except Exception:
-                            continue
-                    exterior = list(poly.exterior.coords)
-                    coords = [ [[float(x), float(y)] for x,y in exterior] ]
-                    for h in holes:
-                        coords.append([[float(x), float(y)] for x,y in h])
-                    features.append({"type": "Feature", "geometry": {"type": "Polygon", "coordinates": coords}, "properties": tags})
-
-            # add standalone ways
-            for wid, coords in ways.items():
-                if wid in used_way_ids:
-                    continue
-                try:
-                    if len(coords) >= 4 and coords[0] == coords[-1]:
-                        poly = Polygon(coords)
-                        if not poly.is_empty:
-                            features.append({"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [ [[float(x), float(y)] for x,y in poly.exterior.coords] ]}, "properties": {}})
-                            continue
-                    features.append({"type": "Feature", "geometry": {"type": "LineString", "coordinates": [[float(x), float(y)] for x,y in coords]}, "properties": {}})
-                except Exception:
-                    continue
-
-            # add standalone nodes
-            node_coords_in_ways = set()
-            for coords in ways.values():
-                for lon, lat in coords:
-                    node_coords_in_ways.add((lat, lon))
-            for nid, (latn, lonn) in nodes.items():
-                if (latn, lonn) in node_coords_in_ways:
-                    continue
-                features.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [float(lonn), float(latn)]}, "properties": {}})
-        else:
-            for wid, coords in ways.items():
-                if len(coords) >= 4 and coords[0] == coords[-1]:
-                    features.append({"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [coords]}, "properties": {}})
-                else:
-                    features.append({"type": "Feature", "geometry": {"type": "LineString", "coordinates": coords}, "properties": {}})
-            for nid, (latn, lonn) in nodes.items():
-                features.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [lonn, latn]}, "properties": {}})
-
-        return features
+    # if crosses antimeridian, produce two bbox ranges
+    bboxes = []
+    if minlon <= maxlon:
+        bboxes.append((minlat, minlon, maxlat, maxlon))
+    else:
+        bboxes.append((minlat, minlon, maxlat, 180.0))
+        bboxes.append((minlat, -180.0, maxlat, maxlon))
 
     def generate():
-        for yi in range(ny):
-            t_minlat = minlat + (lat_span * yi / ny)
-            t_maxlat = minlat + (lat_span * (yi + 1) / ny)
-            for xi in range(nx):
-                t_minlon = minlon + (lon_span * xi / nx)
-                t_maxlon = minlon + (lon_span * (xi + 1) / nx)
-                t_bbox = f"{t_minlat},{t_minlon},{t_maxlat},{t_maxlon}"
-                q = f"""
-[out:json][timeout:25];
-(
-  node["reconstruction"]({t_bbox});
-  way["reconstruction"]({t_bbox});
-  relation["reconstruction"]({t_bbox});
-  node["building"]({t_bbox});
-  way["building"]({t_bbox});
-  relation["building"]({t_bbox});
-);
-(._;>;);
-out geom;
-"""
+        yield json.dumps({'_meta':{'status':'start','bbox':[minlat,minlon,maxlat,maxlon]}}) + '\n'
+        for (mlat, mlon, xlat, xlon) in bboxes:
+            for feat in stream_overpass_tiles(mlat, mlon, xlat, xlon, tag_filters=tag_filters, tile_deg=tile_deg):
                 try:
-                    d = fetch_overpass_cached(q)
+                    yield json.dumps(feat) + '\n'
                 except Exception as e:
-                    yield json.dumps({"_error": "overpass_failed", "details": str(e), "bbox": t_bbox}) + "\n"
-                    continue
-                elems_t = d.get('elements', [])
-                if len(elems_t) > 5000:
-                    yield json.dumps({"_error": "tile_too_large", "bbox": t_bbox, "elements": len(elems_t)}) + "\n"
-                    continue
-                feats = assemble_features_from_elements(elems_t)
-                for f in feats:
-                    yield json.dumps(f) + "\n"
-        yield json.dumps({"_meta": {"status": "done"}}) + "\n"
+                    yield json.dumps({'_error': str(e)}) + '\n'
+        yield json.dumps({'_meta':{'status':'done'}}) + '\n'
 
     return Response(generate(), mimetype='application/x-ndjson')
 
@@ -725,6 +693,118 @@ def api_countries_stream():
     return Response(gen(), mimetype='application/x-ndjson')
 
 
+@app.route('/api/country_info')
+def api_country_info():
+    """Return metadata for a named country:
+       - bbox (minlon,minlat,maxlon,maxlat)
+       - centroid [lon,lat]
+       - basic properties from local geojson (if available)
+       - external data from restcountries (population, area, flag, cca2)
+       - placeholder 'icons' array (can be populated by your packaging pipeline)
+    """
+    name = request.args.get('country')
+    if not name:
+        return jsonify({'error': 'country param required'}), 400
+
+    # try to find country in local geojson
+    local_file = os.path.join(app.static_folder or 'static', 'assets', 'countries.geojson')
+    gj = load_countries_geojson(local_file)
+    country_feat = None
+    if gj and 'features' in gj:
+        lname = name.lower()
+        for f in gj['features']:
+            props = (f.get('properties') or {})
+            cand = (props.get('ADMIN') or props.get('NAME') or props.get('name') or '').lower()
+            if cand == lname:
+                country_feat = f
+                break
+
+    bbox = None
+    centroid = None
+    props = {}
+    # compute bbox/centroid if shapely available and feature found
+    try:
+        from shapely.geometry import shape
+        if country_feat and country_feat.get('geometry'):
+            s = shape(country_feat['geometry'])
+            minx, miny, maxx, maxy = s.bounds
+            bbox = [minx, miny, maxx, maxy]  # lon/min, lat/min, lon/max, lat/max
+            r = s.representative_point()
+            centroid = [float(r.x), float(r.y)]
+            props = dict(country_feat.get('properties') or {})
+    except Exception:
+        # fallback: try to compute centroid/bbox from coordinates
+        if country_feat and country_feat.get('geometry'):
+            geom = country_feat['geometry']
+            coords = []
+            def walk(c):
+                if isinstance(c[0], (float,int)):
+                    coords.append((float(c[0]), float(c[1])))
+                else:
+                    for p in c:
+                        walk(p)
+            try:
+                walk(geom.get('coordinates', []))
+                if coords:
+                    xs = [c[0] for c in coords]; ys = [c[1] for c in coords]
+                    bbox = [min(xs), min(ys), max(xs), max(ys)]
+                    centroid = [(sum(xs)/len(xs)), (sum(ys)/len(ys))]
+                    props = dict(country_feat.get('properties') or {})
+            except Exception:
+                pass
+
+    # fetch RestCountries summary (best-effort)
+    rest = {}
+    try:
+        # prefer fullText search for exact match; fall back to name search
+        qname = urllib.parse.quote(name)
+        url = f'https://restcountries.com/v3.1/name/{qname}?fullText=true'
+        r = requests.get(url, timeout=10)
+        if r.ok:
+            arr = r.json()
+            if isinstance(arr, list) and len(arr) > 0:
+                c = arr[0]
+                rest = {
+                    'population': c.get('population'),
+                    'area': c.get('area'),
+                    'cca2': c.get('cca2'),
+                    'cca3': c.get('cca3'),
+                    'currencies': list((c.get('currencies') or {}).keys()),
+                    'flag': (c.get('flags') or {}).get('svg') or (c.get('flags') or {}).get('png')
+                }
+        else:
+            # try a loose name search
+            url2 = f'https://restcountries.com/v3.1/name/{qname}'
+            r2 = requests.get(url2, timeout=8)
+            if r2.ok:
+                arr2 = r2.json()
+                if isinstance(arr2, list) and len(arr2) > 0:
+                    c = arr2[0]
+                    rest = {
+                        'population': c.get('population'),
+                        'area': c.get('area'),
+                        'cca2': c.get('cca2'),
+                        'cca3': c.get('cca3'),
+                        'currencies': list((c.get('currencies') or {}).keys()),
+                        'flag': (c.get('flags') or {}).get('svg') or (c.get('flags') or {}).get('png')
+                    }
+    except Exception:
+        rest = {}
+
+    # placeholder icons: your packaging step can produce a list of {lat,lon,type,url,label}
+    icons = []  # example: [{'lat':51.0,'lon':-114.0,'type':'linus','url':'/static/assets/icons/linus-xyz.png','label':'Project A'}]
+
+    resp = {
+        'country': name,
+        'bbox': bbox,
+        'centroid': centroid,
+        'properties': props,
+        'rest': rest,
+        'icons': icons
+    }
+    return jsonify(resp)
+
+
 @app.route('/favicon.ico')
 def favicon():
     # return a small inline SVG as favicon to avoid 404 in dev
@@ -738,3 +818,5 @@ if __name__ == '__main__':
     print("Working")
     # enable threaded to improve responsiveness for concurrent requests in dev
     app.run(debug=True, threaded=True)
+
+

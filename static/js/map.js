@@ -154,7 +154,7 @@ async function fetchCountries(simplify = 0.2) {
 }
 
 // New: stream country outlines (NDJSON) and render incrementally.
-async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null, simplify=0.1 } = {}) {
+async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null, simplify=0 } = {}) {
   // when fetching countries we want to clear existing country outlines and labels
   clearAllFeatures();
   // build query string
@@ -171,13 +171,15 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
   if (!res.ok) {
     const txt = await res.text();
     console.warn('Countries stream failed', txt);
-    return;
+    return { ok: false, error: txt, processedFeatures: 0, processedLabels: 0 };
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
-  // placeholder for labels or additional metadata
-  const pendingLabels = [];
+  // progress counters
+  let processedFeatures = 0;
+  let processedLabels = 0;
+
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -199,8 +201,10 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       if (!geom) continue;
       if (geom.type === 'LineString') {
         renderCountryLine(geom.coordinates, 0xffffff, 1);
+        processedFeatures++;
       } else if (geom.type === 'MultiLineString') {
         for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+        processedFeatures++;
       }
       // collect label info and add label (country name)
       if (obj.properties && obj.properties.name) {
@@ -219,6 +223,9 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
           }
           if (latc !== null && lonc !== null) {
             addCountryLabelSprite(obj.properties.name, latc, lonc, priority);
+            // New: create country button (for country list UI)
+            createCountryButton(obj.properties.name, lonc, latc);
+            processedLabels++;
           }
         } catch (e) {
           // ignore label errors
@@ -232,14 +239,24 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       const obj = JSON.parse(buf.trim());
       if (obj && obj.geometry) {
         const geom = obj.geometry;
-        if (geom.type === 'LineString') renderCountryLine(geom.coordinates, 0xffffff, 1);
-        else if (geom.type === 'MultiLineString') for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+        if (geom.type === 'LineString') { renderCountryLine(geom.coordinates, 0xffffff, 1); processedFeatures++; }
+        else if (geom.type === 'MultiLineString') { for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1); processedFeatures++; }
+        if (obj.properties && obj.properties.name) {
+          const rep = geometryRepresentativeLatLon(geom);
+          if (rep) {
+            addCountryLabelSprite(obj.properties.name, rep.lat, rep.lon, obj.properties.label_priority||0);
+            createCountryButton(obj.properties.name, rep.lon, rep.lat);
+            processedLabels++;
+          }
+        }
       }
     } catch (e) {
       // ignore
     }
   }
-  // labels are created during streaming; they'll be updated each frame
+
+  // return progress summary
+  return { ok: true, processedFeatures, processedLabels };
 }
 
 // compute a representative lat/lon for a LineString or MultiLineString geometry
@@ -337,6 +354,7 @@ function addCountryLabelSprite(name, lat, lon, priority = 0) {
   sprite.position.copy(worldPos);
   sprite.userData.worldPos = worldPos.clone();
   sprite.userData.priority = typeof priority === 'number' ? priority : 0;
+  sprite.userData.countryName = name;            // <- add this so click handler can read name
   // initial scale -- will be adjusted each frame to keep consistent pixel size
   sprite.scale.set(0.4, 0.14, 1);
   scene.add(sprite);
@@ -630,4 +648,256 @@ animate();
 
 // fetch and render country borders via streaming (covers full globe initially)
 // bbox format: minlat,minlon,maxlat,maxlon
-fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 0.2 });
+fetchCountriesStream({ bbox: '-90,-180,90,180' });
+
+// --- Add click handling, info panel UI and icon rendering ----
+
+// create an info panel DOM element (right side, semi-opaque)
+const infoPanel = document.createElement('div');
+infoPanel.id = 'info-panel';
+infoPanel.style.position = 'fixed';
+infoPanel.style.top = '8%';
+infoPanel.style.right = '-420px'; // start hidden off-screen
+infoPanel.style.width = '360px';
+infoPanel.style.maxWidth = '40%';
+infoPanel.style.height = '84%';
+infoPanel.style.background = 'rgba(11,16,32,0.5)'; // 50% opacity
+infoPanel.style.color = '#fff';
+infoPanel.style.padding = '12px';
+infoPanel.style.borderRadius = '8px';
+infoPanel.style.overflow = 'auto';
+infoPanel.style.boxShadow = '0 6px 24px rgba(0,0,0,0.6)';
+infoPanel.style.zIndex = '9999';
+infoPanel.style.display = 'block'; // remain in DOM but off-screen
+infoPanel.style.transition = 'right 280ms ease, opacity 280ms ease';
+infoPanel.innerHTML = `
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+    <strong id="info-title">Country</strong>
+    <button id="info-close" style="background:transparent;border:none;color:#fff;font-size:20px;cursor:pointer;">✕</button>
+  </div>
+  <div id="info-content"><em>Loading...</em></div>
+`;
+document.body.appendChild(infoPanel);
+document.getElementById('info-close').addEventListener('click', () => {
+  // close panel (slide out)
+  infoPanel.style.right = '-420px';
+});
+
+// create a floating list of country buttons (left side)
+const countryList = document.createElement('div');
+countryList.id = 'country-list';
+countryList.style.position = 'fixed';
+countryList.style.top = '12%';
+countryList.style.left = '12px';
+countryList.style.maxHeight = '76%';
+countryList.style.overflow = 'auto';
+countryList.style.zIndex = '9999';
+countryList.style.background = 'rgba(11,16,32,0.6)';
+countryList.style.padding = '6px';
+countryList.style.borderRadius = '6px';
+countryList.style.color = '#fff';
+countryList.style.fontSize = '13px';
+countryList.style.backdropFilter = 'blur(4px)';
+document.body.appendChild(countryList);
+
+// keep track to avoid duplicate buttons
+const countryButtonIndex = new Set();
+
+function createCountryButton(name, lon = null, lat = null) {
+  if (!name) return;
+  const key = name.trim();
+  if (countryButtonIndex.has(key)) return;
+  countryButtonIndex.add(key);
+  const btn = document.createElement('button');
+  btn.className = 'country-btn';
+  btn.textContent = name;
+  btn.style.display = 'block';
+  btn.style.width = '100%';
+  btn.style.margin = '4px 0';
+  btn.style.textAlign = 'left';
+  btn.style.background = 'transparent';
+  btn.style.border = '1px solid rgba(255,255,255,0.08)';
+  btn.style.color = '#fff';
+  btn.style.padding = '6px 8px';
+  btn.style.borderRadius = '4px';
+  btn.style.cursor = 'pointer';
+  btn.dataset.name = name;
+  if (lat !== null && lon !== null) {
+    btn.dataset.lat = lat;
+    btn.dataset.lon = lon;
+  }
+  btn.addEventListener('click', async (e) => {
+    const cname = e.currentTarget.dataset.name;
+    const clat = parseFloat(e.currentTarget.dataset.lat || '0');
+    const clon = parseFloat(e.currentTarget.dataset.lon || '0');
+    if (!isNaN(clat) && !isNaN(clon)) {
+      centerOnLatLon(clat, clon, 3.5);
+    }
+    await showCountryInfoPanel(cname);
+    // slide panel into view
+    infoPanel.style.right = '12px';
+  });
+  countryList.appendChild(btn);
+}
+
+// ...existing code...
+
+// inside the streaming loop in fetchCountriesStream where you parse each streamed country feature:
+// find the section that processes each line/feature and add createCountryButton(...)
+ // Example insertion context (replace the "for (const line of lines) {…}" block's processing)
+ // ...existing code...
+ // when you parse a streamed feature 'obj' that has properties.name and properties.centroid:
+ // after existing label/sprite creation add:
+ // createCountryButton(name, centroidLon, centroidLat)
+// ...existing code...
+
+// fetch country info from server and populate panel; also render returned icons
+async function showCountryInfoPanel(countryName, worldPos=null) {
+  const title = document.getElementById('info-title');
+  const content = document.getElementById('info-content');
+  title.textContent = countryName;
+  content.innerHTML = '<p>Loading data…</p>';
+  infoPanel.style.display = 'block';
+
+  try {
+    const res = await fetch(`/api/country_info?country=${encodeURIComponent(countryName)}`);
+    if (!res.ok) {
+      content.innerHTML = `<p>Error loading info: ${await res.text()}</p>`;
+      return;
+    }
+    const data = await res.json();
+    // basic display
+    const rest = data.rest || {};
+    const props = data.properties || {};
+    const centroid = data.centroid ? `${data.centroid[1]?.toFixed(4) || ''}, ${data.centroid[0]?.toFixed(4) || ''}` : '';
+    const bbox = data.bbox ? data.bbox.map(n => Number(n).toFixed(4)).join(', ') : '';
+    const pop = rest.population ? rest.population.toLocaleString() : 'n/a';
+    const area = rest.area ? rest.area.toLocaleString() + ' km²' : 'n/a';
+    let flagHtml = '';
+    if (rest.flag) flagHtml = `<div style="margin:8px 0"><img src="${rest.flag}" alt="flag" style="width:100%;max-width:200px;border-radius:4px"/></div>`;
+
+    content.innerHTML = `
+      ${flagHtml}
+      <p><strong>Centroid</strong>: ${centroid}</p>
+      <p><strong>BBox</strong>: ${bbox}</p>
+      <p><strong>Population</strong>: ${pop}</p>
+      <p><strong>Area</strong>: ${area}</p>
+      <p><strong>Source properties</strong>: ${Object.keys(props).length ? JSON.stringify(props) : 'none'}</p>
+      <div id="info-icons" style="margin-top:12px"><strong>Icons / features</strong><div id="info-icons-list"></div></div>
+    `;
+
+    // Clear previously-rendered icon sprites for this country
+    if (!window._countryIconSprites) window._countryIconSprites = [];
+    for (const s of window._countryIconSprites) { try { featurePoints.remove(s); } catch(e){} }
+    window._countryIconSprites.length = 0;
+
+    // render any icons returned by server (expect array of {lat,lon,type,url,label})
+    const icons = data.icons || [];
+    const iconsList = document.getElementById('info-icons-list');
+    iconsList.innerHTML = '';
+    for (const ic of icons) {
+      const label = ic.label || ic.type || '';
+      const lat = parseFloat(ic.lat), lon = parseFloat(ic.lon);
+      let sprite = null;
+      if (ic.url) {
+        // use image URL texture
+        const tex = new THREE.TextureLoader().load(ic.url);
+        const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+        sprite = new THREE.Sprite(mat);
+        sprite.scale.set(0.08, 0.08, 1);
+      } else {
+        // fallback: colored dot
+        const dot = document.createElement('canvas');
+        dot.width = 48; dot.height = 48;
+        const ctx = dot.getContext('2d');
+        ctx.fillStyle = '#ffdd44';
+        ctx.beginPath(); ctx.arc(24,24,12,0,Math.PI*2); ctx.fill();
+        const tex = new THREE.CanvasTexture(dot);
+        const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+        sprite = new THREE.Sprite(mat);
+        sprite.scale.set(0.06, 0.06, 1);
+      }
+      if (sprite) {
+        const pos = latLonToVector3(lat, lon, (modelScaledRadius || RADIUS) + 0.02);
+        sprite.position.copy(pos);
+        sprite.userData = { country: countryName, label: label };
+        featurePoints.add(sprite);
+        window._countryIconSprites.push(sprite);
+      }
+      // add to list in panel
+      const item = document.createElement('div');
+      item.textContent = `${label} (${lat.toFixed(4)}, ${lon.toFixed(4)})`;
+      item.style.padding = '4px 0';
+      iconsList.appendChild(item);
+    }
+
+  } catch (e) {
+    content.innerHTML = `<p>Error fetching country info: ${e.message}</p>`;
+  }
+}
+
+// expose quick debug helper
+window.getMapPopulateStats = function() {
+  return {
+    countryBorders: countryBorders.children.length,
+    labels: spriteLabels.length,
+    countryButtons: (document.getElementById('country-list')||{children:[]}).children.length
+  };
+};
+// callback pattern (Manifest V2 / compat)
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type !== 'doThing') return; 
+  (async () => {
+    try {
+      const r = await fetch(msg.url);
+      const json = await r.json();
+      sendResponse({ ok: true, data: json });
+    } catch (err) {
+      sendResponse({ ok: false, error: String(err) });
+    }
+  })();
+  return true; // keep channel open until sendResponse is called
+});
+
+// manifest v3: return a Promise (or async function) from listener
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg.type !== 'doThing') return;
+  return (async () => {
+    try {
+      const r = await fetch(msg.url);
+      const json = await r.json();
+      return { ok: true, data: json };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  })();
+});
+
+// Extension message listener (guarded so page won't throw when 'chrome' is undefined)
+if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || msg.type !== 'doThing') return;
+
+    const proc = (async () => {
+      try {
+        const r = await fetch(msg.url);
+        const json = await r.json();
+        return { ok: true, data: json };
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+    })();
+
+    // If sendResponse is available (MV2 compatibility), use it and keep channel open.
+    if (typeof sendResponse === 'function') {
+      proc.then(res => sendResponse(res)).catch(err => sendResponse({ ok: false, error: String(err) }));
+      return true; // keep channel open for async sendResponse
+    }
+
+    // MV3: return a Promise from the listener
+    return proc;
+  });
+} else {
+  // not running inside an extension; no-op
+  console.debug('chrome.runtime not available — extension listeners skipped');
+}

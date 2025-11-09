@@ -68,3 +68,14 @@ html, body {
 	display: none;
 }
 
+#country-list .country-btn:hover {
+  background: rgba(255,255,255,0.04);
+}
+#info-panel {
+  transition: right 280ms ease, opacity 280ms ease;
+}
+/* optional: responsive adjustment */
+@media (max-width: 800px) {
+  #info-panel { width: 80%; right: -90%; }
+}
+
