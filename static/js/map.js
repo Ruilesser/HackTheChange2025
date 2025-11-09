@@ -716,11 +716,32 @@ document.getElementById('locate-me').addEventListener('click', () => {
     const lat = pos.coords.latitude;
     const lon = pos.coords.longitude;
     centerOnLatLon(lat, lon, 3.0);
+
+    clearIconMarkers();
+
     // initial fetch uses radius based on current camera distance
     const dist = camera.position.distanceTo(controls.target || new THREE.Vector3());
     const radius = cameraDistanceToRadius(dist);
     fetchOverpass(lat, lon, radius);
     clearStatus();
+
+    getOsmJson(lat, lon, radius)
+      .then(osmData => processOsmJson(JSON.stringify(osmData)))
+      .then(processedElements => {
+        for (const el of processedElements) {
+          addIconMarker(
+            el.centroid.lat,
+            el.centroid.lon,
+            el.base_elev + (el.effective_height || 0.08),
+            el.icon || '/icons/default.svg'
+          );
+        }
+      })
+      .catch(err => {
+        console.error(err);
+        setStatus('Error processing OSM data', 'error', 5000);
+      });
+
   }, (err) => {
     clearStatus();
     setStatus('Failed to get device location', 'error', 6000);
@@ -1048,6 +1069,66 @@ async function processOsmJson(jsonString) {
 // -----------------------------------------------------------
 // ICON_MAP
 // -----------------------------------------------------------
+async function loadOsmFeaturesAt(lat, lon, radius = 500) {
+  try {
+    // Fetch OSM data near the clicked location
+    const osmJson = await getOsmJson(lat, lon, radius);
+    const jsonString = JSON.stringify(osmJson);
+
+    // Process it into usable structures
+    const elements = await processOsmJson(jsonString);
+
+    // Add markers for each
+    for (const el of elements) {
+      if (el.icon && el.centroid) {
+        addIconMarker(el.centroid.lat, el.centroid.lon, el.icon, 0.08);
+      }
+    }
+
+    console.log(`Placed ${elements.length} OSM icons near (${lat}, ${lon})`);
+  } catch (err) {
+    console.error("Failed to load OSM features:", err);
+  }
+}
+
+let iconMarkers = [];
+
+function addIconMarker(lat, lon, elevation, imageUrl) {
+  const EARTH_RADIUS = 6371000; // meters
+
+  // Convert lat/lon/elev → XYZ
+  const radius = EARTH_RADIUS + elevation;
+  const phi = (90 - lat) * (Math.PI / 180);
+  const theta = (lon + 180) * (Math.PI / 180);
+
+  const x = radius * Math.sin(phi) * Math.cos(theta);
+  const y = radius * Math.cos(phi);
+  const z = radius * Math.sin(phi) * Math.sin(theta);
+
+  // Create a sprite for the icon
+  const texture = new THREE.TextureLoader().load(imageUrl);
+  const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+  const sprite = new THREE.Sprite(material);
+
+  // Scale & position
+  sprite.scale.set(10000, 10000, 1);
+  sprite.position.set(x, y, z);
+
+  scene.add(sprite);
+  iconMarkers.push(sprite);
+  return sprite;
+}
+
+function clearIconMarkers() {
+  for (const marker of iconMarkers) {
+    scene.remove(marker);
+    marker.geometry?.dispose(); // clean up geometry if needed
+    marker.material?.dispose(); // clean up material if needed
+  }
+  iconMarkers = []; // reset the array
+}
+
+
 const ICON_MAP = {
     "amenity": { 
         "bar": "icons/amenity_recreational.svg",
