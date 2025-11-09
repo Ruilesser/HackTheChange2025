@@ -768,8 +768,13 @@ document.getElementById('locate-me').addEventListener('click', () => {
 // helpers: convert 3D vector to lat/lon
 function vector3ToLatLon(v) {
   const r = v.length() || 1;
-  const lat = 90 - Math.acos(v.y / r) * (180 / Math.PI);
-  const lon = Math.atan2(v.z, -v.x) * (180 / Math.PI) - 180;
+  // latitude from asin for numerical stability
+  const lat = Math.asin(v.y / r) * (180 / Math.PI);
+  // reconstruct longitude from x/z using the same convention as latLonToVector3
+  let lon = Math.atan2(v.z, -v.x) * (180 / Math.PI) - 180;
+  // normalize longitude to [-180, 180]
+  while (lon < -180) lon += 360;
+  while (lon > 180) lon -= 360;
   return { lat, lon };
 }
 
