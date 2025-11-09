@@ -1,3 +1,71 @@
-<html>
-        
+</html><!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>About PlanetPulse</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/css/bootstrap.min.css">
+  <link rel="stylesheet" href="/static/home.css">
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+  <script src="https://maxcdn.bootstrapcdn.com/bootstrap/3.4.1/js/bootstrap.min.js"></script>
+</head>
+<body>
+
+<nav class="navbar navbar-inverse navbar-fixed-top navbar-expand-lg">
+  <div class="container-fluid">
+    <!-- Navbar header -->
+    <div class="navbar-header">
+      <button type="button" class="navbar-toggle" data-toggle="collapse" data-target="#myNavbar">
+        <!-- Navbar button triple line -->
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>                        
+      </button>
+      <a class="navbar-brand" href="/">
+        <img src="../static/assets/logob.png" alt="logo" class="navbar-logo">
+      </a>
+    </div>
+
+    <!-- Navbar links -->
+    <div class="collapse navbar-collapse" id="myNavbar">
+      <ul class="nav navbar-nav">
+        <li><a href="/map">Map</a></li>
+        <li class="active"><a href="../templates/about.html">About</a></li>
+        <li><a href ="/contact">Contact</a></li>
+      </ul>
+    </div>
+  </div>
+</nav>
+
+<!-- Main Page Content -->
+<div class="title-container">
+  <h1 class="title">About <p class="italic">PlanetPulse</p></h1>
+  <div class="text" style="font-size: 20px; margin-left: 200px;">
+    <h2 style="font-family: RadleyRegular; font-size: 32px; color: #191919; margin-top: 40px;">Project Overview</h2>
+    <p>This is a 3D, browser-based tool for examining country-level development using infrastructure, mobility, and citizen feedback data. Users navigate an interactive wireframe globe to zoom from national to regional detail, viewing OpenStreetMap layers for roads, paths, transit lines, and points of interest. Context panels surface development indicators such as network density, connectivity, and accessibility to support analysis rather than decoration.</p>
+    <h3 style="font-family: RadleyRegular; font-size: 28px; color: #191919; margin-top: 30px;">Visualization</h3>
+    <p>The globe uses a minimalist wireframe with subdued landmass shading to preserve legibility and performance. At the country scale, users view macro patterns like urban extent and inter-city corridors; at local scales, they inspect details such as sidewalks, crossings, oneway restrictions, barriers, and surface types. Layers are toggleable, filterable, and timestamped (where available) to enable regional comparisons, change tracking, and alignment of qualitative reports with quantitative structure. Legends and layer semantics are designed for clarity with sensible defaults.</p>
+    <h3 style="font-family: RadleyRegular; font-size: 28px; color: #191919; margin-top: 30px;">Reporting and Moderation</h3>
+    <p>Users submit structured reviews and non-emergency reports (e.g., blocked curb cuts, lighting failures, obstructions, signage issues) and can notify authorities for issues requiring attention. Submissions are anchored to map geometry (roads, nodes, crossings) for precise locations. Moderation includes deduplication, reputation signals, and status tracking; analytics aggregate reports to identify patterns and inform stakeholders.</p>
+    <h3 style="font-family: RadleyRegular; font-size: 28px; color: #191919; margin-top: 30px;">Technical Stack and Accessibility</h3>
+    <p>WebGL (e.g., Three.js) renders the globe; vector tiles and GeoJSON stream OSM data; web workers handle client-side filtering. The pipeline supports regional extracts and on-demand queries with caching for responsiveness. Accessibility features include keyboard navigation, high-contrast modes, semantic labels, and screen reader-friendly layer descriptions. The system is designed for live demos, reliable operation, and scalable analyses.</p>
+    <h2 style="font-family: RadleyRegular; font-size: 32px; color: #191919; margin-top: 40px;">Meet our amazing team:</h2>
+    <ul style="list-style-type: none; padding-left: 0;">
+      <li>Theophilus Eriatra</li>
+      <li>Jasper Harvey</li>
+      <li>Richard Nguyen</li>
+      <li>Salma Aboulnaga</li>
+      <li>Linus Yang</li>
+    </ul>
+  </div>
+</div>
+
+<div class="break">
+</div>
+
+<script>
+  // Add any scripts you need here
+</script>
+
+</body>
 </html>
