@@ -1,10 +1,28 @@
-// map.js - module that builds a Three.js globe and supports markers
+// Clean map.js — single, consolidated module for the globe viewer.
 import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
 import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
 
 const container = document.getElementById('map-container');
+const statusEl = document.getElementById('status');
 
-// lightweight FPS / timing panel
+function setStatus(msg, level = 'info', timeout = 4000) {
+  if (!statusEl) { console.log('[status]', level, msg); return; }
+  statusEl.textContent = msg || '';
+  statusEl.style.color = level === 'error' ? '#ff8888' : (level === 'loading' ? '#ffd166' : '#ddd');
+  if (statusEl._clearTimer) clearTimeout(statusEl._clearTimer);
+  if (timeout && msg) statusEl._clearTimer = setTimeout(() => { statusEl.textContent = ''; }, timeout);
+}
+
+// Scene + renderer
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x08121a);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(container.clientWidth, container.clientHeight, false);
+renderer.domElement.style.display = 'block';
+container.appendChild(renderer.domElement);
+
+// FPS overlay
 const fpsCounter = document.createElement('div');
 fpsCounter.id = 'fps-counter';
 fpsCounter.style.position = 'absolute';
@@ -16,235 +34,339 @@ fpsCounter.style.color = '#fff';
 fpsCounter.style.font = '12px monospace';
 fpsCounter.style.zIndex = 9999;
 fpsCounter.style.pointerEvents = 'none';
-fpsCounter.innerHTML = '';
 container.appendChild(fpsCounter);
 
-// debug overlay (shows sub-satellite, simplify, cooldown)
-const debugOverlay = document.createElement('div');
-debugOverlay.id = 'debug-overlay';
-debugOverlay.style.position = 'absolute';
-debugOverlay.style.left = '8px';
-debugOverlay.style.bottom = '8px';
-debugOverlay.style.padding = '6px 8px';
-debugOverlay.style.background = 'rgba(0,0,0,0.6)';
-debugOverlay.style.color = '#9fc';
-debugOverlay.style.font = '12px monospace';
-debugOverlay.style.zIndex = 9999;
-debugOverlay.style.pointerEvents = 'none';
-debugOverlay.innerHTML = '';
-container.appendChild(debugOverlay);
+// Camera & controls
+const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
+camera.position.set(0, 0, 3.5);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.dampingFactor = 0.08; controls.minDistance = 1.5; controls.maxDistance = 8;
 
-function passAllDataTo(targetFunction) {
-  const allData = {
-    timestamp: Date.now(),
-    osmData: window.lastOsmData, // You'd need to store this
-    countryData: window.lastCountryData, // Store this too
-    iconData: window.lastIconData,
-    viewState: {
-      lat: getSubSatelliteLatLon().lat,
-      lon: getSubSatelliteLatLon().lon,
-      zoom: camera.position.length()
-    }
-  };
-  
-  if (typeof targetFunction === 'function') {
-    targetFunction(allData);
-  }
-  
-  return allData;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x222222, 0.9));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.6); dirLight.position.set(5,3,5); scene.add(dirLight);
+
+// Globe
+const RADIUS = 1;
+const globeMat = new THREE.MeshStandardMaterial({ color: 0x234f6b, roughness: 1, metalness: 0 });
+const globe = new THREE.Mesh(new THREE.SphereGeometry(RADIUS, 64, 64), globeMat); scene.add(globe);
+
+// Groups
+let countryBorders = new THREE.Group(); let countryLabels = new THREE.Group(); scene.add(countryBorders); scene.add(countryLabels);
+
+function latLonToVector3(lat, lon, radius = RADIUS) {
+  const phi = (90 - lat) * (Math.PI / 180);
+  const theta = (lon + 180) * (Math.PI / 180);
+  const x = -(radius * Math.sin(phi) * Math.cos(theta));
+  const z = radius * Math.sin(phi) * Math.sin(theta);
+  const y = radius * Math.cos(phi);
+  return new THREE.Vector3(x,y,z);
 }
 
-
-// Function to pass all acquired data to any other function
-function useAcquiredData(callback) {
-  if (typeof callback === 'function') {
-    const allData = {
-      osm: lastOsmData,
-      countries: lastCountryData,
-      icons: lastIconData,
-      metadata: {
-        timestamp: Date.now(),
-        osmFeatureCount: lastOsmData?.features?.length || 0,
-        countryFeatureCount: lastCountryData.length,
-        viewState: getSubSatelliteLatLon()
-      }
-    };
-    callback(allData);
-  }
-  return {
-    osm: lastOsmData,
-    countries: lastCountryData,
-    icons: lastIconData
-  };
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); ctx.fill();
 }
 
-// Observer culling toggle (controls both client-side culling and whether
-// we send an observer_lat/observer_lon to server endpoints). Default: disabled.
-// Set false so features are rendered by default (no client/server culling)
-// unless the user explicitly enables it.
-let observerCullingEnabled = false;
-const observerCullingToggleEl = document.getElementById('toggle-observer-culling');
-if (observerCullingToggleEl) {
-  try {
-    observerCullingEnabled = !!observerCullingToggleEl.checked;
-    observerCullingToggleEl.addEventListener('change', (ev) => {
-      observerCullingEnabled = !!ev.target.checked;
-      setStatus(`Observer culling ${observerCullingEnabled ? 'enabled' : 'disabled'}`, 'info', 2000);
-    });
-  } catch (e) { /* ignore UI hookup errors */ }
+function createLabelSprite(text) {
+  const font = '600 18px sans-serif'; const padding = 8;
+  const canvas = document.createElement('canvas'); const ctx = canvas.getContext('2d'); ctx.font = font;
+  const metrics = ctx.measureText(text); const w = Math.ceil(metrics.width) + padding * 2; const h = 28 + padding * 2;
+  canvas.width = w; canvas.height = h;
+  ctx.fillStyle = 'rgba(8,12,20,0.85)'; roundRect(ctx, 0, 0, w, h, 6);
+  ctx.fillStyle = '#fff'; ctx.font = font; ctx.textBaseline = 'middle'; ctx.fillText(text, padding, h/2);
+  const tex = new THREE.CanvasTexture(canvas); tex.minFilter = THREE.LinearFilter;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: true, depthWrite: false });
+  const sp = new THREE.Sprite(mat); sp.userData = { pixelW: w, pixelH: h }; return sp;
 }
 
-// Enable verbose logging for country outline streaming when debugging
-const DEBUG_COUNTRY_STREAM = true;
+function disposeGroup(g) { if (!g) return; for (const c of g.children) { try { if (c.geometry) c.geometry.dispose(); } catch (e) {} try { if (c.material && c.material.map) c.material.map.dispose(); } catch (e) {} } try { scene.remove(g); } catch(e) {} }
 
-// Toggle polygon simplification. Set false to disable simplifying polygons
-// client-side and request full-precision outlines from the server.
-const POLYGON_SIMPLIFICATION_ENABLED = false;
+function addLine(coords, group, color = 0xffffff, opacity = 1) {
+  if (!coords || coords.length < 2) return; const pts = coords.map(([lon,lat]) => latLonToVector3(lat, lon, RADIUS + 0.002)); const arr = new Float32Array(pts.length * 3); pts.forEach((p,i)=>{ arr[i*3]=p.x; arr[i*3+1]=p.y; arr[i*3+2]=p.z; }); const geom = new THREE.BufferGeometry(); geom.setAttribute('position', new THREE.BufferAttribute(arr, 3)); const mat = new THREE.LineBasicMaterial({ color, transparent: opacity<1, opacity }); const line = new THREE.Line(geom, mat); group.add(line);
+}
 
-// OSM / elevation controls
-let lastOsmElementsCount = 0; // number of elements in last OSM payload
-let lastIconRequestTime = 0;
-let currentOverpassController = null;
-let currentIconRequestController = null;
-// Add these with your other global variables at the top
-let lastOsmData = null;
-let lastCountryData = [];
-let lastIconData = null;
-
-const MIN_ICON_REQUEST_INTERVAL = 2000; // 2 seconds between icon requests
-//const ELEVATION_ENABLED = true; // set false to disable elevation lookups entirely
-//const ELEVATION_BATCH_THRESHOLD = 5000; // skip per-element elevation if payload larger than this
-// maximum radius (meters) for fetching detailed OSM icons — prevents huge requests
-const ICON_OSM_RADIUS_MAX = 300;
-const OVERPASS_MAX_RADIUS = 2000;
-const OVERPASS_SPLIT_THRESHOLD = 800; // Lower threshold to split earlier
-
-// debug overlay updater (throttled)
-let lastDebugUpdate = 0;
-const DEBUG_UPDATE_MS = 500;
-function updateDebugOverlay() {
-  try {
-    const sub = getSubSatelliteLatLon() || { lat: null, lon: null };
-    let latStr = '-';
-    let lonStr = '-';
-    if (sub && typeof sub.lat === 'number') latStr = sub.lat.toFixed(4);
-    if (sub && typeof sub.lon === 'number') lonStr = sub.lon.toFixed(4);
-    // compute radius/simplify for display
-    let targetVec = null;
-    if (sub && sub.lat !== null && sub.lon !== null) targetVec = latLonToVector3(sub.lat, sub.lon, modelScaledRadius || RADIUS);
-    else targetVec = controls.target.clone();
-    const dist = camera.position.distanceTo(targetVec);
-    const radius = cameraDistanceToRadius(dist);
-    const simplify = computeSimplifyForRadius(radius);
-    const cooldownRem = Math.max(0, (overpassCooldownUntil || 0) - Date.now());
-    const pendingCount = countryBordersPending ? countryBordersPending.children.length : 0;
-    const bordersCount = countryBorders ? countryBorders.children.length : 0;
-    debugOverlay.innerHTML =
-      `<div style="line-height:1.2">
-         <strong>sub</strong>: ${latStr}, ${lonStr}<br>
-         <strong>radius</strong>: ${radius} m<br>
-         <strong>simplify</strong>: ${simplify.toFixed(3)}<br>
-         <strong>cooldown</strong>: ${Math.ceil(cooldownRem/1000)}s<br>
-         <strong>inFlight</strong>: ${inFlightOverpassRequests}<br>
-         <strong>pendingBorders</strong>: ${pendingCount}<br>
-         <strong>currentBorders</strong>: ${bordersCount}
-       </div>`;
-  } catch (e) {
-    // don't let overlay errors break render loop
+function renderCountries(geo) {
+  disposeGroup(countryBorders); disposeGroup(countryLabels);
+  countryBorders = new THREE.Group(); countryLabels = new THREE.Group(); scene.add(countryBorders); scene.add(countryLabels);
+  const feats = geo && geo.features ? geo.features : [];
+  setStatus(`Loaded ${feats.length} countries`, 'info', 3000);
+  for (const f of feats) {
+    const geom = f.geometry; if (!geom) continue; const name = (f.properties && (f.properties.ADMIN || f.properties.NAME || f.properties.name)) || 'Unknown';
+    if (geom.type === 'LineString') addLine(geom.coordinates, countryBorders, 0xffffff, 0.6);
+    else if (geom.type === 'MultiLineString') for (const p of geom.coordinates) addLine(p, countryBorders, 0xffffff, 0.6);
+    else if (geom.type === 'Polygon') addLine(geom.coordinates[0], countryBorders, 0xffffff, 0.9);
+    else if (geom.type === 'MultiPolygon') for (const poly of geom.coordinates) addLine(poly[0], countryBorders, 0xffffff, 0.9);
+    let lat=null, lon=null;
+    if (f.properties && f.properties.centroid && f.properties.centroid.length>=2) { lon = parseFloat(f.properties.centroid[0]); lat = parseFloat(f.properties.centroid[1]); }
+    else if (geom.type === 'Polygon' && geom.coordinates && geom.coordinates[0] && geom.coordinates[0].length) { const ring = geom.coordinates[0]; const mid = Math.floor(ring.length/2); lon = ring[mid][0]; lat = ring[mid][1]; }
+    if (lat!==null && lon!==null) { const sp = createLabelSprite(name); sp.position.copy(latLonToVector3(lat, lon, RADIUS + 0.03)); sp.scale.set(0.6, 0.18, 1); countryLabels.add(sp); }
   }
 }
 
-// frame timing history (ms)
-const FRAME_HISTORY = 60;
-const frameTimes = [];
-let lastFrameTime = performance.now();
-let smoothedFps = 0;
+async function fetchAndRenderCountries() {
+  setStatus('Loading countries…','loading',null);
+  try { const res = await fetch('/api/countries?simplify=0.0'); if (!res.ok) { setStatus('Failed to load countries','error',4000); console.warn(await res.text()); return; } const geo = await res.json(); renderCountries(geo); console.info('fetchAndRenderCountries: features=', geo.features ? geo.features.length : 0); } catch (e) { console.error('countries fetch failed', e); setStatus('Failed to load countries','error',4000); }
+}
 
-// status element helper (shows short user-facing messages)
+// locate-me
+document.getElementById('locate-me')?.addEventListener('click', () => {
+  setStatus('Requesting location…','loading',8000);
+  if (!navigator.geolocation) { setStatus('Geolocation not supported','error',3000); return; }
+  navigator.geolocation.getCurrentPosition((pos) => { const lat = pos.coords.latitude, lon = pos.coords.longitude; flyToLatLon(lat, lon, 2.5, 900); addUserMarker(lat, lon); setStatus('Centered on your location','info',3000); }, (err) => { setStatus('Location failed','error',3000); console.warn(err); }, { enableHighAccuracy: true, timeout: 10000 });
+});
+
+let userMarker = null;
+function addUserMarker(lat, lon) { if (userMarker) try { scene.remove(userMarker); } catch (e) {} const pos = latLonToVector3(lat, lon, RADIUS + 0.02); const sph = new THREE.Mesh(new THREE.SphereGeometry(0.02,8,8), new THREE.MeshBasicMaterial({ color: 0xffcc33 })); sph.position.copy(pos); userMarker = sph; scene.add(userMarker); }
+
+function flyToLatLon(lat, lon, distanceFactor = 3.0, duration = 900) {
+  const startPos = camera.position.clone(); const startTarget = controls.target.clone(); const endTarget = latLonToVector3(lat, lon, RADIUS); const endCam = endTarget.clone().multiplyScalar(distanceFactor); const t0 = performance.now(); function step() { const t = Math.min(1, (performance.now() - t0) / duration); const e = 1 - Math.pow(1 - t, 3); camera.position.lerpVectors(startPos, endCam, e); controls.target.lerpVectors(startTarget, endTarget, e); controls.update(); if (t < 1) requestAnimationFrame(step); } requestAnimationFrame(step);
+}
+
+function onResize() { renderer.setSize(container.clientWidth, container.clientHeight, false); camera.aspect = container.clientWidth / container.clientHeight; camera.updateProjectionMatrix(); }
+window.addEventListener('resize', onResize);
+
+// FPS & animate
+const FRAME_HISTORY = 60; const frameTimes = []; let lastFrameTime = performance.now(); let smoothedFps = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now(); const dt = Math.max(0.001, now - lastFrameTime); lastFrameTime = now; const instFps = 1000.0 / dt; smoothedFps = smoothedFps * 0.93 + instFps * 0.07; frameTimes.push(dt); if (frameTimes.length > FRAME_HISTORY) frameTimes.shift();
+  controls.update(); renderer.render(scene, camera);
+  for (const s of countryLabels.children) { const d = camera.position.distanceTo(s.position) || 1; const scale = Math.min(Math.max(d * 0.06, 0.25), 1.2); s.scale.set(scale, scale * 0.35, 1); s.lookAt(camera.position); }
+  let avg = 0, min = Infinity, max = 0; for (const t of frameTimes) { avg += t; if (t < min) min = t; if (t > max) max = t; } const n = frameTimes.length || 1; avg = avg / n; if (min === Infinity) min = 0; fpsCounter.innerHTML = `FPS: ${smoothedFps.toFixed(1)} | frame: ${dt.toFixed(1)} ms — avg ${avg.toFixed(1)} ms`;
+}
+animate();
+
+// Kick off
+fetchAndRenderCountries();
+// Simplified map-like GeoJSON viewer (globe + orbit controls + country labels)
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+
+const container = document.getElementById('map-container');
 const statusEl = document.getElementById('status');
-function setStatus(msg, level = 'info', timeout = 6000) {
-  try {
-    if (!statusEl) return;
-    statusEl.textContent = msg || '';
-    if (level === 'error') {
-      statusEl.style.color = '#ff8888';
-    } else if (level === 'loading') {
-      statusEl.style.color = '#ffd166';
-    } else {
-      statusEl.style.color = '#ddd';
-    }
-    if (statusEl._clearTimer) { clearTimeout(statusEl._clearTimer); statusEl._clearTimer = null; }
-    if (timeout && msg) {
-      statusEl._clearTimer = setTimeout(() => { try { statusEl.textContent = ''; } catch (e) {} }, timeout);
-    }
-  } catch (e) {
-    // ignore
-  }
+
+function setStatus(msg, level = 'info', timeout = 4000) {
+  if (!statusEl) { console.log('[status]', level, msg); return; }
+  statusEl.textContent = msg || '';
+  statusEl.style.color = level === 'error' ? '#ff8888' : (level === 'loading' ? '#ffd166' : '#ddd');
+  if (statusEl._clearTimer) clearTimeout(statusEl._clearTimer);
+  if (timeout && msg) statusEl._clearTimer = setTimeout(() => { statusEl.textContent = ''; }, timeout);
 }
-function clearStatus() { if (statusEl) { statusEl.textContent = ''; if (statusEl._clearTimer) { clearTimeout(statusEl._clearTimer); statusEl._clearTimer = null; } } }
 
+// Scene & renderer
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0b1020);
-
-// enable depth buffer so scene geometry is depth-tested and occludes correctly
-const renderer = new THREE.WebGLRenderer({ antialias: true, depth: true });
-// clamp pixel ratio to avoid huge canvases on hi-dpi devices (Surface Pro etc.)
+scene.background = new THREE.Color(0x08121a);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-// ensure canvas is displayed as block so it sizes predictably across browsers
+renderer.setSize(container.clientWidth, container.clientHeight, false);
 renderer.domElement.style.display = 'block';
 container.appendChild(renderer.domElement);
 
-const camera = new THREE.PerspectiveCamera(45, 2, 0.1, 1000);
+// Camera and controls
+const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
 camera.position.set(0, 0, 3.5);
-
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
+controls.dampingFactor = 0.08;
 controls.minDistance = 1.5;
-controls.maxDistance = 10;
+controls.maxDistance = 8;
 
-// lights
-const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.8);
-scene.add(hemi);
+// Lights
+scene.add(new THREE.HemisphereLight(0xffffff, 0x222222, 0.9));
 const dir = new THREE.DirectionalLight(0xffffff, 0.6);
 dir.position.set(5, 3, 5);
 scene.add(dir);
 
-// globe (procedural sphere)
+// Globe
 const RADIUS = 1;
-let globe = null;
-let modelScaledRadius = RADIUS;
-// how far to push labels out from the globe surface to avoid z-fighting/clipping
-const LABEL_OFFSET = 0.03;
-{
-  const sphereGeo = new THREE.SphereGeometry(RADIUS, 64, 64);
-  const mat = new THREE.MeshStandardMaterial({ color: 0x2266aa, roughness: 1 });
-  globe = new THREE.Mesh(sphereGeo, mat);
-  globe.renderOrder = 0;
-  scene.add(globe);
-}
+const globeMat = new THREE.MeshStandardMaterial({ color: 0x234f6b, roughness: 1, metalness: 0 });
+const globe = new THREE.Mesh(new THREE.SphereGeometry(RADIUS, 64, 64), globeMat);
+scene.add(globe);
 
-// helper: convert lat/lon to 3D on sphere
+// Groups for borders and labels
+let countryBorders = new THREE.Group();
+let countryLabels = new THREE.Group();
+scene.add(countryBorders);
+scene.add(countryLabels);
+
 function latLonToVector3(lat, lon, radius = RADIUS) {
   const phi = (90 - lat) * (Math.PI / 180);
   const theta = (lon + 180) * (Math.PI / 180);
-
   const x = -(radius * Math.sin(phi) * Math.cos(theta));
   const z = radius * Math.sin(phi) * Math.sin(theta);
   const y = radius * Math.cos(phi);
-
   return new THREE.Vector3(x, y, z);
 }
 
-// containers for OSM features
-const featurePoints = new THREE.Group();
-const featureLines = new THREE.Group();
-// current rendered country borders group (swapped on each successful stream)
-let countryBorders = new THREE.Group();
-// pending group used while streaming; created per-stream
-let countryBordersPending = null;
-scene.add(featurePoints);
-scene.add(featureLines);
-scene.add(countryBorders);
+// Create a readable label sprite from text
+function createLabelSprite(text) {
+  const font = '600 24px Inter, sans-serif';
+  const padding = 8;
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.font = font;
+  const metrics = ctx.measureText(text);
+  const w = Math.ceil(metrics.width) + padding * 2;
+  const h = 36 + padding * 2;
+  canvas.width = w; canvas.height = h;
+  // background
+  ctx.fillStyle = 'rgba(8,12,20,0.85)';
+  roundRect(ctx, 0, 0, w, h, 6);
+  ctx.fillStyle = '#ffffff';
+  ctx.font = font;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, padding, h / 2);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.minFilter = THREE.LinearFilter;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: true, depthWrite: false });
+  const sp = new THREE.Sprite(mat);
+  sp.userData = { width: w, height: h };
+  return sp;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// Render GeoJSON features (LineString/Polygon/MultiPolygon)
+function renderCountries(geo) {
+  // clear previous
+  disposeGroup(countryBorders);
+  disposeGroup(countryLabels);
+  countryBorders = new THREE.Group();
+  countryLabels = new THREE.Group();
+  scene.add(countryBorders); scene.add(countryLabels);
+
+  const features = geo && geo.features ? geo.features : [];
+  setStatus(`Loaded ${features.length} countries`, 'info', 3000);
+  for (const f of features) {
+    const geom = f.geometry;
+    const name = (f.properties && (f.properties.ADMIN || f.properties.NAME || f.properties.name)) || 'Unknown';
+    if (!geom) continue;
+    if (geom.type === 'LineString') {
+      addLine(geom.coordinates, countryBorders, 0xffffff, 0.6);
+    } else if (geom.type === 'MultiLineString') {
+      for (const part of geom.coordinates) addLine(part, countryBorders, 0xffffff, 0.6);
+    } else if (geom.type === 'Polygon') {
+      // exterior
+      addLine(geom.coordinates[0], countryBorders, 0xffffff, 0.9);
+    } else if (geom.type === 'MultiPolygon') {
+      for (const poly of geom.coordinates) addLine(poly[0], countryBorders, 0xffffff, 0.9);
+    }
+    // place label at representative point if available in properties.centroid
+    let lat = null, lon = null;
+    if (f.properties && f.properties.centroid && f.properties.centroid.length >= 2) {
+      lon = parseFloat(f.properties.centroid[0]); lat = parseFloat(f.properties.centroid[1]);
+    } else if (geom.type === 'Polygon' && geom.coordinates && geom.coordinates[0] && geom.coordinates[0].length) {
+      const ring = geom.coordinates[0]; const mid = Math.floor(ring.length/2); lon = ring[mid][0]; lat = ring[mid][1];
+    }
+    if (lat !== null && lon !== null) {
+      const sprite = createLabelSprite(name);
+      const pos = latLonToVector3(lat, lon, RADIUS + 0.03);
+      sprite.position.copy(pos);
+      sprite.scale.set(0.6, 0.18, 1);
+      countryLabels.add(sprite);
+    }
+  }
+}
+
+function addLine(coords, group, color = 0xffffff, opacity = 1.0) {
+  if (!coords || coords.length < 2) return;
+  const pts = coords.map(([lon, lat]) => latLonToVector3(lat, lon, RADIUS + 0.002));
+  const arr = new Float32Array(pts.length * 3);
+  pts.forEach((p,i)=>{ arr[i*3]=p.x; arr[i*3+1]=p.y; arr[i*3+2]=p.z; });
+  const geom = new THREE.BufferGeometry(); geom.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  const mat = new THREE.LineBasicMaterial({ color, transparent: opacity < 1.0, opacity });
+  const line = new THREE.Line(geom, mat);
+  group.add(line);
+}
+
+function disposeGroup(g) {
+  if (!g) return;
+  for (const c of g.children) {
+    try { if (c.geometry) c.geometry.dispose(); } catch (e) {}
+    try { if (c.material && c.material.map) c.material.map.dispose(); } catch (e) {}
+  }
+  try { scene.remove(g); } catch (e) {}
+}
+
+// Fetch countries and render
+async function fetchAndRenderCountries() {
+  setStatus('Loading countries…', 'loading', null);
+  try {
+    const res = await fetch('/api/countries?simplify=0.0');
+    if (!res.ok) { setStatus('Failed to load countries', 'error', 4000); console.warn(await res.text()); return; }
+    const geo = await res.json();
+    renderCountries(geo);
+    console.info('fetchAndRenderCountries: features=', geo.features ? geo.features.length : 0);
+  } catch (e) {
+    console.error('countries fetch failed', e); setStatus('Failed to load countries', 'error', 4000);
+  }
+}
+
+// locate-me integration
+document.getElementById('locate-me')?.addEventListener('click', () => {
+  setStatus('Requesting location…', 'loading', 8000);
+  if (!navigator.geolocation) { setStatus('Geolocation not supported', 'error', 3000); return; }
+  navigator.geolocation.getCurrentPosition((pos) => {
+    const lat = pos.coords.latitude, lon = pos.coords.longitude;
+    flyToLatLon(lat, lon, 2.5, 900);
+    addUserMarker(lat, lon);
+    setStatus('Centered on your location', 'info', 3000);
+  }, (err) => { setStatus('Location failed', 'error', 3000); console.warn(err); }, { enableHighAccuracy: true, timeout: 10000 });
+});
+
+// simple user marker
+let userMarker = null;
+function addUserMarker(lat, lon) {
+  if (userMarker) { try { scene.remove(userMarker); } catch (e) {} }
+  const pos = latLonToVector3(lat, lon, RADIUS + 0.02);
+  const mat = new THREE.MeshBasicMaterial({ color: 0xffcc33 });
+  const sph = new THREE.Mesh(new THREE.SphereGeometry(0.02, 8, 8), mat);
+  sph.position.copy(pos);
+  userMarker = sph; scene.add(userMarker);
+}
+
+// fly-to helper
+function flyToLatLon(lat, lon, distanceFactor = 3.0, duration = 900) {
+  const startPos = camera.position.clone();
+  const startTarget = controls.target.clone();
+  const endTarget = latLonToVector3(lat, lon, RADIUS);
+  const endCam = endTarget.clone().multiplyScalar(distanceFactor);
+  const t0 = performance.now();
+  function step() {
+    const t = Math.min(1, (performance.now() - t0) / duration);
+    const e = 1 - Math.pow(1 - t, 3);
+    camera.position.lerpVectors(startPos, endCam, e);
+    controls.target.lerpVectors(startTarget, endTarget, e);
+    controls.update();
+    if (t < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+// animate
+function onResize() { renderer.setSize(container.clientWidth, container.clientHeight, false); camera.aspect = container.clientWidth / container.clientHeight; camera.updateProjectionMatrix(); }
+window.addEventListener('resize', onResize);
+
+function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); // scale labels by distance
+  for (const s of countryLabels.children) {
+    const d = camera.position.distanceTo(s.position) || 1; const scale = Math.min(Math.max(d * 0.06, 0.25), 1.2); s.scale.set(scale, scale * 0.35, 1);
+    // face camera
+    s.lookAt(camera.position);
+  }
+}
+animate();
+
+// startup
+fetchAndRenderCountries();
+
 
 // Overpass rate-limit / cooldown handling
 let overpassCooldownUntil = 0; // ms timestamp until which we should not issue new Overpass requests
