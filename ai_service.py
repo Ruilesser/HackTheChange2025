@@ -204,14 +204,14 @@ async def main_demo():
 
     async def make_query(prompt, model):
         try:
-            resp = await svc.submit(prompt, model=model, timeout=5.0, retries=1)
+            resp = await svc.submit(f"You are an advanced urban planning, sustainability, and community-development analysis model. You produce formal, narrative, human-readable reports, written for community leaders, municipal planners, and urban development authorities. The following JSON is provided to you to analyze: {}. You must never output JSON, code, bullet-free raw data dumps, or any machine-formatted structure. Your output must always be a coherent, multi-section written report in professional planning language.", model=model, timeout=5.0, retries=1)
             print("GOT:", resp)
         except Exception as e:
             print("ERR:", e)
 
     tasks = []
     for i in range(20):
-        model = "ollama" if i % 3 == 0 else ("gemini" if i % 3 == 1 else "local")
+        model = "gemini"
         tasks.append(asyncio.create_task(make_query(f"Question {i}", model)))
 
     await asyncio.gather(*tasks)
