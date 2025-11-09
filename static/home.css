@@ -9,7 +9,8 @@
 }
 
 body {
-  background-image: url('assets/blueback.png') !important;
+  background-color: rgba(233, 236, 239, 0.7) !important;
+  background-image: none !important;
   background-repeat: no-repeat !important;
   background-attachment: fixed !important;
   background-size: cover !important;
