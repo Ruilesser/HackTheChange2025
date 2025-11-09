@@ -57,6 +57,14 @@ scene.add(featurePoints);
 scene.add(featureLines);
 scene.add(countryBorders);
 
+// DOM label container (overlay on top of renderer)
+const labelContainer = document.createElement('div');
+labelContainer.id = 'labels';
+container.appendChild(labelContainer);
+
+// store label objects { el, worldPos: THREE.Vector3 }
+const countryLabels = [];
+
 function clearFeatures() {
   featurePoints.clear();
   featureLines.clear();
@@ -181,9 +189,16 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       } else if (geom.type === 'MultiLineString') {
         for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
       }
-      // collect label info for later (country name)
+      // collect label info and add label (country name)
       if (obj.properties && obj.properties.name) {
-        pendingLabels.push({ name: obj.properties.name, geometry: geom });
+        try {
+          const rep = geometryRepresentativeLatLon(geom);
+          if (rep) {
+            addCountryLabel(obj.properties.name, rep.lat, rep.lon);
+          }
+        } catch (e) {
+          // ignore label errors
+        }
       }
     }
   }
@@ -200,7 +215,68 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       // ignore
     }
   }
-  // TODO: convert pendingLabels into screen labels (future)
+  // labels are created during streaming; they'll be updated each frame
+}
+
+// compute a representative lat/lon for a LineString or MultiLineString geometry
+function geometryRepresentativeLatLon(geom) {
+  if (!geom) return null;
+  if (geom.type === 'LineString') {
+    const coords = geom.coordinates;
+    if (!coords || coords.length === 0) return null;
+    const mid = Math.floor(coords.length / 2);
+    const [lon, lat] = coords[mid];
+    return { lat, lon };
+  } else if (geom.type === 'MultiLineString') {
+    // pick the longest part
+    let best = null;
+    let bestLen = -1;
+    for (const part of geom.coordinates) {
+      if (!part) continue;
+      if (part.length > bestLen) {
+        bestLen = part.length;
+        best = part;
+      }
+    }
+    if (!best || best.length === 0) return null;
+    const mid = Math.floor(best.length / 2);
+    const [lon, lat] = best[mid];
+    return { lat, lon };
+  }
+  return null;
+}
+
+function addCountryLabel(name, lat, lon) {
+  const el = document.createElement('div');
+  el.className = 'country-label';
+  el.textContent = name;
+  labelContainer.appendChild(el);
+  const worldPos = latLonToVector3(lat, lon, (modelScaledRadius || RADIUS) + 0.01);
+  countryLabels.push({ el, worldPos });
+}
+
+// update label screen positions and visibility; called each frame
+function updateCountryLabels() {
+  const width = container.clientWidth;
+  const height = container.clientHeight;
+  const camDir = new THREE.Vector3();
+  camera.getWorldDirection(camDir);
+  for (const item of countryLabels) {
+    const { el, worldPos } = item;
+    // is point facing camera?
+    const toPoint = worldPos.clone().sub(camera.position).normalize();
+    const facing = toPoint.dot(camDir) > 0.12; // threshold to hide labels on far side
+    if (!facing) {
+      el.classList.add('hidden');
+      continue;
+    }
+    // project to NDC
+    const proj = worldPos.clone().project(camera);
+    const x = (proj.x + 1) / 2 * width;
+    const y = (-proj.y + 1) / 2 * height;
+    el.style.transform = `translate(-50%, -50%) translate(${x}px, ${y}px)`;
+    el.classList.remove('hidden');
+  }
 }
 
 function renderPolygon(rings, color = 0x00aa00) {
@@ -434,6 +510,8 @@ function animate() {
   requestAnimationFrame(animate);
   controls.update();
   renderer.render(scene, camera);
+  // update labels after render to ensure camera/projection are current
+  updateCountryLabels();
 }
 
 animate();
