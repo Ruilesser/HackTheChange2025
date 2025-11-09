@@ -1153,6 +1153,7 @@ function testIconPlacement() {
 // -----------------------------------------------------------
 async function getOsmJson(lat, lon, radius = 500) {
     // radius = 500 is the default, can be overwritten by passing a different value
+    if (inOverpassCooldown()) throw new Error('Overpass cooldown active');
     const overpassUrl = "https://overpass-api.de/api/interpreter";
     const query = `
         [out:json];
@@ -1166,16 +1167,35 @@ async function getOsmJson(lat, lon, radius = 500) {
         out skel qt;
     `;
 
-    const response = await fetch(overpassUrl, {
-        method: "POST", // Overpass API expects POST for queries
-        body: query
-    });
-
-    if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+    // Retry with small backoff on transient failures (including occasional 429)
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await fetch(overpassUrl, {
+          method: "POST",
+          body: query
+        });
+        if (!response.ok) {
+          if (response.status === 429) {
+            // respect server rate-limit
+            overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+            setStatus('Overpass rate limit: delaying icon load for 60s', 'error', 8000);
+            throw new Error(`Overpass rate limited (429)`);
+          }
+          const txt = await response.text();
+          throw new Error(`HTTP error! status: ${response.status} - ${txt}`);
+        }
+        return await response.json();
+      } catch (err) {
+        console.warn(`Overpass attempt ${attempt} failed:`, err.message || err);
+        if (attempt < maxAttempts) {
+          const backoff = attempt === 1 ? 1500 : 4000;
+          await new Promise(r => setTimeout(r, backoff));
+          continue;
+        }
+        throw err;
+      }
     }
-
-    return await response.json();
 }
 
 
