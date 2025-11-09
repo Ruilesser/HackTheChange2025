@@ -39,10 +39,12 @@ const DEBUG_COUNTRY_STREAM = true;
 
 // OSM / elevation controls
 let lastOsmElementsCount = 0; // number of elements in last OSM payload
-const ELEVATION_ENABLED = true; // set false to disable elevation lookups entirely
-const ELEVATION_BATCH_THRESHOLD = 5000; // skip per-element elevation if payload larger than this
+//const ELEVATION_ENABLED = true; // set false to disable elevation lookups entirely
+//const ELEVATION_BATCH_THRESHOLD = 5000; // skip per-element elevation if payload larger than this
 // maximum radius (meters) for fetching detailed OSM icons — prevents huge requests
-const ICON_OSM_RADIUS_MAX = 3000;
+const ICON_OSM_RADIUS_MAX = 1000;
+const OVERPASS_MAX_RADIUS = 2000;
+const OVERPASS_SPLIT_THRESHOLD = 2000;
 
 // debug overlay updater (throttled)
 let lastDebugUpdate = 0;
@@ -743,6 +745,12 @@ function simplifyCoords(coords, maxPoints) {
 }
 
 async function fetchOverpass(lat, lon, radiusMeters) {
+  if (radiusMeters > OVERPASS_SPLIT_THRESHOLD) {
+    console.log('Large radius detected, switching to streaming with splitting:', radiusMeters);
+    await fetchOverpassStream(lat, lon, radiusMeters, 25000);
+    return;
+  }
+
   setStatus('Preparing OSM request — computing radius and method...', 'loading', 8000);
   const cacheKey = makeOverpassCacheKey(lat, lon, radiusMeters);
   // use streaming endpoint for larger radii to avoid large single responses
@@ -825,6 +833,13 @@ async function fetchOverpass(lat, lon, radiusMeters) {
 }
 
 async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
+  if (radiusMeters > OVERPASS_SPLIT_THRESHOLD) {
+    console.log('Preventive splitting for large radius:', radiusMeters);
+    setStatus('Splitting large area into smaller queries...', 'loading', 5000);
+    await fetchSplitOverpassQueries(lat, lon, radiusMeters);
+    return; // Stop the original large query
+  }
+
   clearFeatures();
   // remember cache key so we can remove it if the stream fails due to rate-limiting
   const cacheKey = makeOverpassCacheKey(lat, lon, radiusMeters);
@@ -991,6 +1006,55 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
   }
   setStatus(`Done — streamed ${featureCount} features`, 'info', 6000);
 }
+
+// Preventive splitting function for large areas
+async function fetchSplitOverpassQueries(lat, lon, radiusMeters) {
+  const splits = [
+    { latOffset: -0.25, lonOffset: -0.25, name: 'SW' }, // South-West
+    { latOffset: -0.25, lonOffset: 0.25, name: 'SE' },  // South-East  
+    { latOffset: 0.25, lonOffset: -0.25, name: 'NW' },  // North-West
+    { latOffset: 0.25, lonOffset: 0.25, name: 'NE' }    // North-East
+  ];
+  
+  // Convert radius to approximate degrees (rough approximation: 1 degree ≈ 111km)
+  const radiusDeg = radiusMeters / 111320;
+  const splitRadius = radiusMeters / 2; // Each split gets half the radius
+  
+  console.log(`Splitting ${radiusMeters}m area into 4 parts of ${splitRadius}m each`);
+  
+  let successfulSplits = 0;
+  
+  for (let i = 0; i < splits.length; i++) {
+    const split = splits[i];
+    const splitLat = lat + (split.latOffset * radiusDeg);
+    const splitLon = lon + (split.lonOffset * radiusDeg);
+    
+    console.log(`Fetching split ${split.name} at (${splitLat.toFixed(6)}, ${splitLon.toFixed(6)})`);
+    setStatus(`Loading area part ${i + 1}/4...`, 'loading', 3000);
+    
+    // Add delay between requests to avoid overwhelming the server
+    if (i > 0) {
+      await new Promise(resolve => setTimeout(resolve, 1500)); // 1.5 second delay
+    }
+    
+    try {
+      // Use the existing fetchOverpassStream function for each split
+      await fetchOverpassStream(splitLat, splitLon, splitRadius);
+      successfulSplits++;
+      console.log(`✓ Split ${split.name} completed successfully`);
+    } catch (err) {
+      console.warn(`✗ Split query ${split.name} failed:`, err);
+    }
+  }
+  
+  console.log(`Preventive splitting completed: ${successfulSplits}/4 splits successful`);
+  if (successfulSplits > 0) {
+    setStatus(`Loaded ${successfulSplits} area parts successfully`, 'info', 4000);
+  } else {
+    setStatus('Failed to load area parts - try zooming in closer', 'error', 5000);
+  }
+}
+
 
 // Geolocation: center on user's current position
 document.getElementById('locate-me').addEventListener('click', () => {
@@ -1338,7 +1402,7 @@ function lonLatToMeters(lon, lat) {
     const y = Math.log(Math.tan((90 + lat) * Math.PI / 360.0)) * RADIUS;
     return { x, y };
 }
-
+/*
 async function getElevation(lat, lon) {
     // Get elevation (m) for given coordinates using OpenTopoData SRTM90m
     const url = `https://api.opentopodata.org/v1/srtm90m?locations=${lat},${lon}`;
@@ -1348,7 +1412,7 @@ async function getElevation(lat, lon) {
         return data.results[0].elevation ?? 0.0;
     }
     return 0.0;
-}
+} */
 
 // -----------------------------------------------------------
 // Height parsing
@@ -1387,17 +1451,15 @@ function parseHeight(tags) {
 // -----------------------------------------------------------
 // OSM extraction
 // -----------------------------------------------------------
-// -----------------------------------------------------------
-// OSM extraction - IMPROVED VERSION
-// -----------------------------------------------------------
-function extractElements(osmJson) {
-    /**
+
+     /**
      * Extract all 'way' and 'node' elements from full JSON
      * node coordinates into lat/lon points.
      * Returns a list of objects like:
      * { points: [...], tags: {...}, type: 'way' }
      * You can filter by tag (e.g. 'building', 'highway')
      */
+function extractElements(osmJson) {
     const elements = osmJson.elements || [];
     const nodes = Object.fromEntries(
         elements.filter(n => n.type === "node")
@@ -1406,45 +1468,55 @@ function extractElements(osmJson) {
 
     const extracted = [];
     
-    // Expanded list of relevant tags for icons
-    const relevantTags = [
-        'amenity', 'shop', 'tourism', 'leisure', 'building', 'natural', 'emergency', 
-        'office', 'historic', 'man_made', 'highway', 'military', 'aerialway', 
-        'aeroway', 'power', 'public_transport', 'water'
-    ];
+    // Priority tags in order of importance
+    const priorityTags = ['amenity', 'shop', 'tourism', 'leisure', 'building', 'historic', 'railway', 'aeroway'];
+    
+    // Values to EXCLUDE (unimportant features)
+    const excludeValues = {
+        amenity: ['bench', 'waste_basket', 'recycling', 'vending_machine', 'post_box', 'telephone'],
+        shop: ['kiosk', 'newsagent', 'tobacco', 'alcohol'],
+        tourism: ['information', 'artwork'],
+        leisure: ['picnic_table', 'bench', 'playground'],
+        highway: ['traffic_signals', 'street_lamp', 'crossing'] // Exclude all highway features
+    };
     
     for (const el of elements) {
         if (el.type === "node") {
-            // Only include nodes with relevant tags
             if (el.tags && Object.keys(el.tags).length > 0) {
-                const hasRelevantTag = relevantTags.some(tag => tag in el.tags);
-                if (hasRelevantTag) {
-                    extracted.push({
-                        points: [{ lat: el.lat, lon: el.lon }],
-                        tags: el.tags,
-                        id: el.id,
-                        type: el.type
-                    });
+                const hasPriorityTag = priorityTags.some(tag => tag in el.tags);
+                if (hasPriorityTag) {
+                    // Check if we should exclude this element
+                    let shouldExclude = false;
+                    for (const [tagKey, tagValue] of Object.entries(el.tags)) {
+                        if (excludeValues[tagKey] && excludeValues[tagKey].includes(tagValue)) {
+                            shouldExclude = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!shouldExclude) {
+                        extracted.push({
+                            points: [{ lat: el.lat, lon: el.lon }],
+                            tags: el.tags,
+                            id: el.id,
+                            type: el.type
+                        });
+                    }
                 }
             }
         } 
-        else if (el.type === "way") {
-            const points = el.nodes?.map(nid => nodes[nid]).filter(Boolean);
-            if (points?.length && el.tags) {
-                const hasRelevantTag = relevantTags.some(tag => tag in el.tags);
-                if (hasRelevantTag) {
-                    extracted.push({
-                        points,
-                        tags: el.tags || {},
-                        id: el.id,
-                        type: el.type
-                    });
-                }
-            }
-        }
+        // Skip ways for now to reduce complexity
     }
     
-    console.log(`Extracted ${extracted.length} relevant elements (${elements.length} total in OSM data)`);
+    console.log(`Extracted ${extracted.length} priority elements (${elements.length} total in OSM data)`);
+    
+    // Sort by priority (amenity first, then shop, etc.)
+    extracted.sort((a, b) => {
+        const aPriority = priorityTags.findIndex(tag => tag in a.tags);
+        const bPriority = priorityTags.findIndex(tag => tag in b.tags);
+        return aPriority - bPriority;
+    });
+    
     return extracted;
 }
 
@@ -1567,6 +1639,7 @@ async function processElement(element, iconMap) {
         
     // Get elevation with error handling. Skip expensive elevation lookups for very large OSM payloads.
     let baseElev = 0.0;
+    /*
     try {
       if (ELEVATION_ENABLED && lastOsmElementsCount > 0 && lastOsmElementsCount <= ELEVATION_BATCH_THRESHOLD) {
         baseElev = await getElevation(lat, lon);
@@ -1579,7 +1652,7 @@ async function processElement(element, iconMap) {
     } catch (elevErr) {
       console.warn(`Elevation API failed for (${lat}, ${lon}):`, elevErr);
       baseElev = 0.0;
-    }
+    } */
         
         const heightInfo = isBuilding(element) ? parseHeight(element.tags) : {
             height: 0.0,
@@ -1622,29 +1695,80 @@ async function processElement(element, iconMap) {
         }
 
 // Test function to verify icons are working
+// Test function to verify icons are working by loading actual OSM data
+// Test function to verify icons are working by loading actual OSM data
 function testIconPlacement() {
   // Clear existing icons
   clearIconMarkers();
   
-  // Add test icons at known locations
+  // Use known urban coordinates instead of current view
   const testLocations = [
     { lat: 40.7128, lon: -74.0060, name: "New York" },
     { lat: 51.5074, lon: -0.1278, name: "London" },
-    { lat: 35.6762, lon: 139.6503, name: "Tokyo" },
-    { lat: -33.8688, lon: 151.2093, name: "Sydney" }
+    { lat: 35.6762, lon: 139.6503, name: "Tokyo" }
   ];
   
-  testLocations.forEach(location => {
-    addIconMarker(
-      location.lat,
-      location.lon,
-      '/static/icons/default.svg', // Make sure this icon exists
-      0.02
-    );
-  });
+  // Test the first location
+  const testLocation = testLocations[0];
+  const lat = testLocation.lat;
+  const lon = testLocation.lon;
+  const radius = 500;
   
-  console.log('Test icons placed at known locations');
-  setStatus('Test icons placed - check console for errors', 'info', 5000);
+  console.log(`Testing icon placement at (${lat}, ${lon}) with ${radius}m radius`);
+  setStatus(`Loading OSM icons in ${testLocation.name}...`, 'loading', 5000);
+  
+  // Also fly to the location so you can see the icons
+  flyToLatLon(lat, lon, 3.0, 1000, () => {
+    // Call the function that loads actual OSM data and places icons
+    loadOsmFeaturesAt(lat, lon, radius)
+      .then(() => {
+        console.log('Test icon placement completed');
+        setStatus(`Test completed - loaded OSM icons in ${testLocation.name}`, 'info', 5000);
+      })
+      .catch(err => {
+        console.error('Test icon placement failed:', err);
+        setStatus('Test failed - check console for errors', 'error', 5000);
+      });
+  });
+}
+
+// Alternative test function that uses specific known locations
+function testIconPlacementAtKnownLocations() {
+  // Clear existing icons
+  clearIconMarkers();
+  
+  // Test at multiple known locations with urban areas
+  const testLocations = [
+    { lat: 40.7128, lon: -74.0060, name: "New York", radius: 500 },
+    { lat: 51.5074, lon: -0.1278, name: "London", radius: 500 },
+    { lat: 35.6762, lon: 139.6503, name: "Tokyo", radius: 500 },
+    { lat: 48.8566, lon: 2.3522, name: "Paris", radius: 500 }
+  ];
+  
+  console.log('Testing icon placement at multiple known locations');
+  setStatus('Loading OSM icons at test locations...', 'loading', 8000);
+  
+  // Load icons for each test location
+  let completed = 0;
+  testLocations.forEach(location => {
+    loadOsmFeaturesAt(location.lat, location.lon, location.radius)
+      .then(() => {
+        completed++;
+        console.log(`Completed loading icons for ${location.name}`);
+        
+        if (completed === testLocations.length) {
+          setStatus(`Test completed - loaded OSM icons at ${testLocations.length} locations`, 'info', 5000);
+        }
+      })
+      .catch(err => {
+        completed++;
+        console.error(`Failed to load icons for ${location.name}:`, err);
+        
+        if (completed === testLocations.length) {
+          setStatus(`Test completed with some errors - check console`, 'error', 5000);
+        }
+      });
+  });
 }
 
 // Call this to test icon placement
@@ -1660,55 +1784,33 @@ async function getOsmJson(lat, lon, radius = 500) {
         }
         
         const overpassUrl = "https://overpass-api.de/api/interpreter";
-        // Expanded query to include all the new tags
+        
+        // SIMPLIFIED AND CORRECTED QUERY
         const query = `
-            [out:json][timeout:25];
-            (
-                // Original tags
-                node(around:${radius},${lat},${lon})[amenity][!highway];
-                node(around:${radius},${lat},${lon})[shop];
-                node(around:${radius},${lat},${lon})[tourism];
-                node(around:${radius},${lat},${lon})[leisure];
-                node(around:${radius},${lat},${lon})[building=yes];
-                node(around:${radius},${lat},${lon})[natural];
-                node(around:${radius},${lat},${lon})[emergency];
-                
-                // New tags
-                node(around:${radius},${lat},${lon})[highway];
-                node(around:${radius},${lat},${lon})[military];
-                node(around:${radius},${lat},${lon})[aerialway];
-                node(around:${radius},${lat},${lon})[aeroway];
-                node(around:${radius},${lat},${lon})[power];
-                node(around:${radius},${lat},${lon})[public_transport];
-                node(around:${radius},${lat},${lon})[water];
-                
-                // Ways with original tags
-                way(around:${radius},${lat},${lon})[amenity][!highway];
-                way(around:${radius},${lat},${lon})[shop];
-                way(around:${radius},${lat},${lon})[tourism];
-                way(around:${radius},${lat},${lon})[leisure];
-                way(around:${radius},${lat},${lon})[building=yes];
-                way(around:${radius},${lat},${lon})[natural];
-                way(around:${radius},${lat},${lon})[emergency];
-                
-                // Ways with new tags
-                way(around:${radius},${lat},${lon})[highway];
-                way(around:${radius},${lat},${lon})[military];
-                way(around:${radius},${lat},${lon})[aerialway];
-                way(around:${radius},${lat},${lon})[aeroway];
-                way(around:${radius},${lat},${lon})[power];
-                way(around:${radius},${lat},${lon})[public_transport];
-                way(around:${radius},${lat},${lon})[water];
-            );
-            out body;
-            >;
-            out skel qt;
-        `;
+[out:json][timeout:25];
+(
+  // Key amenities
+  node(around:${radius},${lat},${lon})[amenity];
+  node(around:${radius},${lat},${lon})[shop];
+  node(around:${radius},${lat},${lon})[tourism];
+  node(around:${radius},${lat},${lon})[leisure];
+  node(around:${radius},${lat},${lon})[building];
+  node(around:${radius},${lat},${lon})[historic];
+  node(around:${radius},${lat},${lon})[railway=station];
+  node(around:${radius},${lat},${lon})[aeroway=terminal];
+);
+out body;
+>;
+out skel qt;
+`;
 
-        console.log('Fetching OSM data for icons...');
+        console.log('Fetching SIMPLIFIED OSM data for icons...');
         const response = await fetch(overpassUrl, {
             method: "POST",
-            body: query
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+            },
+            body: `data=${encodeURIComponent(query)}`
         });
         
         if (!response.ok) {
@@ -1721,10 +1823,10 @@ async function getOsmJson(lat, lon, radius = 500) {
         }
         
         const data = await response.json();
-        console.log('OSM data received:', data.elements?.length || 0, 'elements');
+        console.log('SIMPLIFIED OSM data received:', data.elements?.length || 0, 'elements');
         return data;
     } catch (err) {
-        console.error('Failed to fetch OSM data:', err);
+        console.error('Failed to fetch simplified OSM data:', err);
         throw err;
     }
 }
@@ -1813,9 +1915,12 @@ async function loadOsmFeaturesAt(lat, lon, radius = 500) {
 function addIconMarker(lat, lon, imageUrl, elevation) {
   // Use the same coordinate system as your globe (radius = 1)
   const radius = (modelScaledRadius || RADIUS) + 0.02; // Slightly above surface + elevation offset
-  
+
+  const offsetLat = lat + (Math.random() * 0.01 - 0.005); // ±0.005 degrees
+  const offsetLon = lon + (Math.random() * 0.01 - 0.005); // ±0.005 degrees
+
   // Use your existing latLonToVector3 function for consistency
-  const position = latLonToVector3(lat, lon, radius);
+  const position = latLonToVector3(offsetLat, offsetLon, radius);
   console.log(`Loading icon from: ${imageUrl}`);
   console.log(`Full URL would be: ${new URL(imageUrl, window.location.origin).href}`);
   
