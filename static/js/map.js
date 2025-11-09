@@ -1310,33 +1310,45 @@ function extractElements(osmJson) {
 
     const extracted = [];
     
+    // Expanded list of relevant tags for icons
+    const relevantTags = [
+        'amenity', 'shop', 'tourism', 'leisure', 'building', 'natural', 'emergency', 
+        'office', 'historic', 'man_made', 'highway', 'military', 'aerialway', 
+        'aeroway', 'power', 'public_transport', 'water'
+    ];
+    
     for (const el of elements) {
         if (el.type === "node") {
-            // Handle standalone nodes with tags
+            // Only include nodes with relevant tags
             if (el.tags && Object.keys(el.tags).length > 0) {
-                extracted.push({
-                    points: [{ lat: el.lat, lon: el.lon }],
-                    tags: el.tags,
-                    id: el.id,
-                    type: el.type
-                });
+                const hasRelevantTag = relevantTags.some(tag => tag in el.tags);
+                if (hasRelevantTag) {
+                    extracted.push({
+                        points: [{ lat: el.lat, lon: el.lon }],
+                        tags: el.tags,
+                        id: el.id,
+                        type: el.type
+                    });
+                }
             }
         } 
         else if (el.type === "way") {
             const points = el.nodes?.map(nid => nodes[nid]).filter(Boolean);
             if (points?.length && el.tags) {
-                extracted.push({
-                    points,
-                    tags: el.tags || {},
-                    id: el.id,
-                    type: el.type
-                });
+                const hasRelevantTag = relevantTags.some(tag => tag in el.tags);
+                if (hasRelevantTag) {
+                    extracted.push({
+                        points,
+                        tags: el.tags || {},
+                        id: el.id,
+                        type: el.type
+                    });
+                }
             }
         }
-        // Note: relations are more complex and may need special handling
     }
     
-    console.log(`Extracted ${extracted.length} elements (${elements.length} total in OSM data)`);
+    console.log(`Extracted ${extracted.length} relevant elements (${elements.length} total in OSM data)`);
     return extracted;
 }
 
@@ -1359,10 +1371,7 @@ function getIconForElement(element, iconMap) {
      */
     const tags = element.tags || {};
     
-    // Debug: log the tags we're processing
-    if (Object.keys(tags).length > 0) {
-        console.log('Processing element tags:', tags);
-    }
+    console.log('Processing element tags for icon:', tags);
     
     // Check each tag in priority order
     if (tags.amenity) {
@@ -1373,12 +1382,24 @@ function getIconForElement(element, iconMap) {
         return iconMap.amenity._default;
     }
     
+    if (tags.shop) {
+        return iconMap.shop._default;
+    }
+    
+    if (tags.tourism) {
+        return iconMap.tourism._default;
+    }
+    
+    if (tags.leisure) {
+        return iconMap.leisure._default;
+    }
+    
     if (tags.building) {
         return iconMap.building._default;
     }
     
-    if (tags.shop) {
-        return iconMap.shop._default;
+    if (tags.natural) {
+        return iconMap.natural._default;
     }
     
     if (tags.emergency) {
@@ -1389,20 +1410,50 @@ function getIconForElement(element, iconMap) {
         return iconMap.emergency._default;
     }
     
-    if (tags.natural) {
-        return iconMap.natural._default;
+    if (tags.office) {
+        return iconMap.office._default;
     }
     
-    // Check other known tag categories
-    const knownCategories = ['tourism', 'leisure', 'office', 'historic', 'man_made'];
-    for (const category of knownCategories) {
-        if (tags[category]) {
-            return iconMap[category]?._default || iconMap._global_default._default;
-        }
+    if (tags.historic) {
+        return iconMap.historic._default;
     }
     
-    // Global fallback
-    return iconMap._global_default._default;
+    if (tags.man_made) {
+        return iconMap.man_made._default;
+    }
+    
+    // New tags added
+    if (tags.highway) {
+        return iconMap.highway._default;
+    }
+    
+    if (tags.military) {
+        return iconMap.military._default;
+    }
+    
+    if (tags.aerialway) {
+        return iconMap.aerialway._default;
+    }
+    
+    if (tags.aeroway) {
+        return iconMap.aeroway._default;
+    }
+    
+    if (tags.power) {
+        return iconMap.power._default;
+    }
+    
+    if (tags.public_transport) {
+        return iconMap.public_transport._default;
+    }
+    
+    if (tags.water) {
+        return iconMap.water._default;
+    }
+    
+    // Skip elements that don't have relevant tags for icons
+    console.log('No relevant tags found for icon, skipping element');
+    return null;
 }
 
 async function processElement(element, iconMap) {
@@ -1500,52 +1551,80 @@ function testIconPlacement() {
 // Main entry point
 // -----------------------------------------------------------
 async function getOsmJson(lat, lon, radius = 500) {
-    // radius = 500 is the default, can be overwritten by passing a different value
-    if (inOverpassCooldown()) throw new Error('Overpass cooldown active');
-    const overpassUrl = "https://overpass-api.de/api/interpreter";
-    const query = `
-        [out:json];
-        (
-          node(around:${radius},${lat},${lon});
-          way(around:${radius},${lat},${lon});
-          relation(around:${radius},${lat},${lon});
-        );
-        out body;
-        >;
-        out skel qt;
-    `;
+    try {
+        if (inOverpassCooldown()) {
+            throw new Error('Overpass cooldown active');
+        }
+        
+        const overpassUrl = "https://overpass-api.de/api/interpreter";
+        // Expanded query to include all the new tags
+        const query = `
+            [out:json][timeout:25];
+            (
+                // Original tags
+                node(around:${radius},${lat},${lon})[amenity][!highway];
+                node(around:${radius},${lat},${lon})[shop];
+                node(around:${radius},${lat},${lon})[tourism];
+                node(around:${radius},${lat},${lon})[leisure];
+                node(around:${radius},${lat},${lon})[building=yes];
+                node(around:${radius},${lat},${lon})[natural];
+                node(around:${radius},${lat},${lon})[emergency];
+                
+                // New tags
+                node(around:${radius},${lat},${lon})[highway];
+                node(around:${radius},${lat},${lon})[military];
+                node(around:${radius},${lat},${lon})[aerialway];
+                node(around:${radius},${lat},${lon})[aeroway];
+                node(around:${radius},${lat},${lon})[power];
+                node(around:${radius},${lat},${lon})[public_transport];
+                node(around:${radius},${lat},${lon})[water];
+                
+                // Ways with original tags
+                way(around:${radius},${lat},${lon})[amenity][!highway];
+                way(around:${radius},${lat},${lon})[shop];
+                way(around:${radius},${lat},${lon})[tourism];
+                way(around:${radius},${lat},${lon})[leisure];
+                way(around:${radius},${lat},${lon})[building=yes];
+                way(around:${radius},${lat},${lon})[natural];
+                way(around:${radius},${lat},${lon})[emergency];
+                
+                // Ways with new tags
+                way(around:${radius},${lat},${lon})[highway];
+                way(around:${radius},${lat},${lon})[military];
+                way(around:${radius},${lat},${lon})[aerialway];
+                way(around:${radius},${lat},${lon})[aeroway];
+                way(around:${radius},${lat},${lon})[power];
+                way(around:${radius},${lat},${lon})[public_transport];
+                way(around:${radius},${lat},${lon})[water];
+            );
+            out body;
+            >;
+            out skel qt;
+        `;
 
-    // Retry with small backoff on transient failures (including occasional 429)
-    const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
+        console.log('Fetching OSM data for icons...');
         const response = await fetch(overpassUrl, {
-          method: "POST",
-          body: query
+            method: "POST",
+            body: query
         });
+        
         if (!response.ok) {
-          if (response.status === 429) {
-            // respect server rate-limit
-            overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
-            setStatus('Overpass rate limit: delaying icon load for 60s', 'error', 8000);
-            throw new Error(`Overpass rate limited (429)`);
-          }
-          const txt = await response.text();
-          throw new Error(`HTTP error! status: ${response.status} - ${txt}`);
+            if (response.status === 429) {
+                overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+                setStatus('Overpass rate limit: delaying icon load for 60s', 'error', 8000);
+                throw new Error('Overpass rate limited (429)');
+            }
+            throw new Error(`HTTP error! status: ${response.status}`);
         }
-        return await response.json();
-      } catch (err) {
-        console.warn(`Overpass attempt ${attempt} failed:`, err.message || err);
-        if (attempt < maxAttempts) {
-          const backoff = attempt === 1 ? 1500 : 4000;
-          await new Promise(r => setTimeout(r, backoff));
-          continue;
-        }
+        
+        const data = await response.json();
+        console.log('OSM data received:', data.elements?.length || 0, 'elements');
+        return data;
+    } catch (err) {
+        console.error('Failed to fetch OSM data:', err);
         throw err;
-      }
     }
 }
-
 
 async function processOsmJson(jsonString) {
     /**
