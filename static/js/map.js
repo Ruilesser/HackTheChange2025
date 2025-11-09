@@ -1398,7 +1398,15 @@ document.getElementById('locate-me').addEventListener('click', () => {
           immediate: true, 
           customRadius: 1000,
           forceIcons: true  // Add this flag
+
+          
         });
+        // Send all data to your target function after loading
+        setTimeout(() => {
+          const allData = passAllDataTo(yourTargetFunction);
+          console.log('Location data sent to target function:', allData);
+        }, 2000); // Wait for data to load
+        
       } catch (e) { console.warn('locate-me: requestVisibleData failed', e); }
     });
     clearStatus();
