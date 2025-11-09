@@ -34,6 +34,26 @@ debugOverlay.style.pointerEvents = 'none';
 debugOverlay.innerHTML = '';
 container.appendChild(debugOverlay);
 
+function passAllDataTo(targetFunction) {
+  const allData = {
+    timestamp: Date.now(),
+    osmData: window.lastOsmData, // You'd need to store this
+    countryData: window.lastCountryData, // Store this too
+    iconData: window.lastIconData,
+    viewState: {
+      lat: getSubSatelliteLatLon().lat,
+      lon: getSubSatelliteLatLon().lon,
+      zoom: camera.position.length()
+    }
+  };
+  
+  if (typeof targetFunction === 'function') {
+    targetFunction(allData);
+  }
+  
+  return allData;
+}
+
 // Observer culling toggle (controls both client-side culling and whether
 // we send an observer_lat/observer_lon to server endpoints). Default: disabled.
 // Set false so features are rendered by default (no client/server culling)
@@ -62,6 +82,11 @@ let lastOsmElementsCount = 0; // number of elements in last OSM payload
 let lastIconRequestTime = 0;
 let currentOverpassController = null;
 let currentIconRequestController = null;
+// Add these with your other global variables at the top
+let lastOsmData = null;
+let lastCountryData = [];
+let lastIconData = null;
+
 const MIN_ICON_REQUEST_INTERVAL = 2000; // 2 seconds between icon requests
 //const ELEVATION_ENABLED = true; // set false to disable elevation lookups entirely
 //const ELEVATION_BATCH_THRESHOLD = 5000; // skip per-element elevation if payload larger than this
@@ -421,6 +446,7 @@ async function fetchCountries(simplify = 0.2) {
 
 // New: stream country outlines (NDJSON) and render incrementally.
 async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null, simplify=0.1 } = {}) {
+  lastCountryData = [];
   // when fetching countries we want to clear only OSM feature layers (points/lines)
   // but keep current country outlines until the new stream completes to avoid
   // an abrupt visual clear. We'll stream into `countryBordersPending` and
@@ -1137,7 +1163,6 @@ async function fetchOverpass(lat, lon, radiusMeters) {
     return;
   }
 
-  // ... rest of the original fetchOverpass implementation ...
   setStatus('Preparing OSM request — computing radius and method...', 'loading', 8000);
   const cacheKey = makeOverpassCacheKey(lat, lon, radiusMeters);
   
@@ -1180,6 +1205,10 @@ async function fetchOverpass(lat, lon, radiusMeters) {
     }
     
     const geojson = await res.json();
+    
+    // === ADD THIS: Store the OSM data globally ===
+    lastOsmData = geojson;
+    console.log('Stored OSM data:', geojson.features?.length || 0, 'features');
     
     // Client-side culling preparation
     const camDir = new THREE.Vector3(); 
