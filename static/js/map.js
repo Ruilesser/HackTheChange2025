@@ -1,6 +1,29 @@
 // map.js - module that builds a Three.js globe and supports markers
 import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
 import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+class AIService {
+  constructor(apiKey) {
+    this.genAI = new GoogleGenerativeAI(apiKey);
+    this.model = this.genAI.getGenerativeModel({ model: "gemini-pro" });
+  }
+
+  async submit(timeout = 5000) {
+    try {
+      // Add your JSON data to the prompt
+      const fullPrompt = `You are an advanced urban planning, sustainability, and community-development analysis model. You produce formal, narrative, human-readable reports, written for community leaders, municipal planners, and urban development authorities. You must never output JSON, code, bullet-free raw data dumps, or any machine-formatted structure. Your output must always be a coherent, multi-section written report in professional planning language. You will analyze this JSON consisting of restaurants, hospitals, and other amenities and services, and in turn you will give recommendations for improving urban planning, sustainability, and community development based on the data provided. Your report must be at least 500 words long and cover multiple aspects of urban planning and community development. Here is the data: ${JSON.stringify(data)}`;
+
+      const result = await this.model.generateContent(fullPrompt);
+      const response = await result.response;
+      return response.text();
+
+    } catch (error) {
+      console.error("Error calling Gemini API:", error);
+      throw error;
+    }
+  }
+}
 
 const container = document.getElementById('map-container');
 
@@ -40,7 +63,7 @@ function setStatus(msg, level = 'info', timeout = 6000) {
     }
     if (statusEl._clearTimer) { clearTimeout(statusEl._clearTimer); statusEl._clearTimer = null; }
     if (timeout && msg) {
-      statusEl._clearTimer = setTimeout(() => { try { statusEl.textContent = ''; } catch (e) {} }, timeout);
+      statusEl._clearTimer = setTimeout(() => { try { statusEl.textContent = ''; } catch (e) { } }, timeout);
     }
   } catch (e) {
     // ignore
@@ -210,7 +233,7 @@ async function fetchCountries(simplify = 0.2) {
 }
 
 // New: stream country outlines (NDJSON) and render incrementally.
-async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null, simplify=0.1 } = {}) {
+async function fetchCountriesStream({ bbox = null, lat = null, lon = null, radius = null, simplify = 0.1 } = {}) {
   // when fetching countries we want to clear existing country outlines and labels
   clearAllFeatures();
   // build query string
@@ -443,7 +466,7 @@ function addCountryLabelSprite(name, lat, lon, priority = 0) {
       return;
     }
     // new label has higher priority: remove existing and replace
-    try { scene.remove(existing); } catch (e) {}
+    try { scene.remove(existing); } catch (e) { }
     if (existing.material && existing.material.map) existing.material.map.dispose();
     if (existing.material) existing.material.dispose();
     const idx = spriteLabels.indexOf(existing);
@@ -488,7 +511,7 @@ function updateLabelSprites() {
     candidates.push({ sprite: s, x, y, priority: s.userData.priority, wp });
   }
   // sort by priority desc (bigger first)
-  candidates.sort((a,b) => b.priority - a.priority);
+  candidates.sort((a, b) => b.priority - a.priority);
   const placed = [];
   const threshold = 80; // pixel distance threshold for label collision
   for (const c of candidates) {
@@ -546,7 +569,7 @@ async function fetchOverpass(lat, lon, radiusMeters) {
           qs.set('observer_lat', String(centerLatLon.lat));
           qs.set('observer_lon', String(centerLatLon.lon));
         }
-      } catch (e) {}
+      } catch (e) { }
       setStatus('Requesting Overpass (synchronous) — waiting for server...', 'loading', 15000);
       // abort if server doesn't respond in time
       const res = await abortableFetch(`/api/overpass?${qs.toString()}`, { method: 'GET' }, 25000);
@@ -616,7 +639,7 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
       qs.set('observer_lat', String(centerLatLon.lat));
       qs.set('observer_lon', String(centerLatLon.lon));
     }
-  } catch (e) {}
+  } catch (e) { }
   let res;
   try {
     setStatus('Requesting Overpass stream — waiting for server...', 'loading', null);
@@ -785,7 +808,26 @@ document.getElementById('locate-me').addEventListener('click', () => {
     clearStatus();
     setStatus('Failed to get device location', 'error', 6000);
     alert('Failed to get location: ' + (err && err.message));
-  }, { enableHighAccuracy: true, maximumAge: 60000, timeout: 10000 });
+  }, { enableHighAccuracy: true, maximumAge: 60000, timeout: 10000 })
+
+  // Usage
+  async function makeQuery() {
+    const svc = new AIService("your-api-key-here");
+
+    try {
+      const resp = await svc.submit("Your analysis prompt here");
+      console.log("GOT:", resp);
+      return resp; // This is your Gemini response
+    } catch (error) {
+      console.error("ERR:", error);
+    }
+  }
+
+  // Call the function
+  makeQuery().then(response => {
+    console.log("Final response:", response);
+    // Now you have the response text from Gemini
+  });;
 });
 
 // helpers: convert 3D vector to lat/lon
@@ -951,21 +993,21 @@ setTimeout(() => {
 // Utilities
 // -----------------------------------------------------------
 function lonLatToMeters(lon, lat) {
-    const RADIUS = 6378137.0;  // Earth's radius in meters (WGS84)
-    const x = lon * RADIUS * Math.PI / 180.0;
-    const y = Math.log(Math.tan((90 + lat) * Math.PI / 360.0)) * RADIUS;
-    return { x, y };
+  const RADIUS = 6378137.0;  // Earth's radius in meters (WGS84)
+  const x = lon * RADIUS * Math.PI / 180.0;
+  const y = Math.log(Math.tan((90 + lat) * Math.PI / 360.0)) * RADIUS;
+  return { x, y };
 }
 
 async function getElevation(lat, lon) {
-    // Get elevation (m) for given coordinates using OpenTopoData SRTM90m
-    const url = `https://api.opentopodata.org/v1/srtm90m?locations=${lat},${lon}`;
-    const response = await fetch(url);
-    const data = await response.json();
-    if (data.results && data.results.length > 0) {
-        return data.results[0].elevation ?? 0.0;
-    }
-    return 0.0;
+  // Get elevation (m) for given coordinates using OpenTopoData SRTM90m
+  const url = `https://api.opentopodata.org/v1/srtm90m?locations=${lat},${lon}`;
+  const response = await fetch(url);
+  const data = await response.json();
+  if (data.results && data.results.length > 0) {
+    return data.results[0].elevation ?? 0.0;
+  }
+  return 0.0;
 }
 
 // -----------------------------------------------------------
@@ -973,157 +1015,157 @@ async function getElevation(lat, lon) {
 // -----------------------------------------------------------
 // Building heights
 function parseHeight(tags) {
-    /** Parse building height and min_height if available. */
-    function safeFloat(value) {
-        try {
-            return parseFloat(value.toLowerCase().replace("m", "").trim());
-        } catch {
-            return null;
-        }
+  /** Parse building height and min_height if available. */
+  function safeFloat(value) {
+    try {
+      return parseFloat(value.toLowerCase().replace("m", "").trim());
+    } catch {
+      return null;
     }
+  }
 
-    let height = safeFloat(tags.height ?? "");
-    let minHeight = safeFloat(tags.min_height ?? tags["building:min_height"] ?? "");
-    let levels = safeFloat(tags["building:levels"] ?? "");
-    let minLevels = safeFloat(tags["building:min_level"] ?? "");
+  let height = safeFloat(tags.height ?? "");
+  let minHeight = safeFloat(tags.min_height ?? tags["building:min_height"] ?? "");
+  let levels = safeFloat(tags["building:levels"] ?? "");
+  let minLevels = safeFloat(tags["building:min_level"] ?? "");
 
-    // height if missing
-    if (height === null && levels !== null) height = levels * 3.0;
-    if (minHeight === null && minLevels !== null) minHeight = minLevels * 3.0;
+  // height if missing
+  if (height === null && levels !== null) height = levels * 3.0;
+  if (minHeight === null && minLevels !== null) minHeight = minLevels * 3.0;
 
-    // Fallbacks - check for heights
-    if (height === null) height = "building" in tags ? 10.0 : 0.0;
-    if (minHeight === null) minHeight = 0.0;
+  // Fallbacks - check for heights
+  if (height === null) height = "building" in tags ? 10.0 : 0.0;
+  if (minHeight === null) minHeight = 0.0;
 
-    return {
-        height,
-        min_height: minHeight,
-        effective_height: Math.max(0.0, height - minHeight) // USE THIS FOR HEIGHT ON MAP
-    };
+  return {
+    height,
+    min_height: minHeight,
+    effective_height: Math.max(0.0, height - minHeight) // USE THIS FOR HEIGHT ON MAP
+  };
 }
 
 // -----------------------------------------------------------
 // OSM extraction
 // -----------------------------------------------------------
 function extractElements(osmJson) {
-    /**
-     * Extract all 'way' elements from full JSON
-     * node coordinates into lat/lon points.
-     * Returns a list of objects like:
-     * { points: [...], tags: {...}, type: 'way' }
-     * You can filter by tag (e.g. 'building', 'highway')
-     */
-    const elements = osmJson.elements || [];
-    const nodes = Object.fromEntries(elements.filter(n => n.type === "node").map(n => [n.id, n]));
+  /**
+   * Extract all 'way' elements from full JSON
+   * node coordinates into lat/lon points.
+   * Returns a list of objects like:
+   * { points: [...], tags: {...}, type: 'way' }
+   * You can filter by tag (e.g. 'building', 'highway')
+   */
+  const elements = osmJson.elements || [];
+  const nodes = Object.fromEntries(elements.filter(n => n.type === "node").map(n => [n.id, n]));
 
-    const extracted = [];
-    for (const el of elements) {
-        if (el.type === "way") {
-            const points = el.nodes?.map(nid => nodes[nid] && ({ lat: nodes[nid].lat, lon: nodes[nid].lon })).filter(Boolean);
-            if (points?.length) {
-                extracted.push({
-                    points,
-                    tags: el.tags ?? {},
-                    id: el.id,
-                    type: el.type
-                });
-            }
-        }
+  const extracted = [];
+  for (const el of elements) {
+    if (el.type === "way") {
+      const points = el.nodes?.map(nid => nodes[nid] && ({ lat: nodes[nid].lat, lon: nodes[nid].lon })).filter(Boolean);
+      if (points?.length) {
+        extracted.push({
+          points,
+          tags: el.tags ?? {},
+          id: el.id,
+          type: el.type
+        });
+      }
     }
-    return extracted;
+  }
+  return extracted;
 }
 
 function isBuilding(element) {
-    // True if element is a building (has 'building' tag)
-    return "building" in element.tags;
+  // True if element is a building (has 'building' tag)
+  return "building" in element.tags;
 }
 
 // -----------------------------------------------------------
 // Processing functions
 // -----------------------------------------------------------
 function getIconForElement(element, iconMap) {
-    /**
-     * Assign an icon based on tags:
-     * - Recreational amenities get generic recreational icon
-     * - Other amenities use value-specific icons if available, otherwise default
-     * - Natural uses one generic icon
-     * - Emergency uses value-specific icons
-     * - Other keys use default per key or global fallback
-     */
-    const tags = element.tags || {};
+  /**
+   * Assign an icon based on tags:
+   * - Recreational amenities get generic recreational icon
+   * - Other amenities use value-specific icons if available, otherwise default
+   * - Natural uses one generic icon
+   * - Emergency uses value-specific icons
+   * - Other keys use default per key or global fallback
+   */
+  const tags = element.tags || {};
 
-    for (const [key, value] of Object.entries(tags)) {
-        // --- Amenity ---
-        if (key === "amenity") {
-            const recreationList = [
-                "bar", "bbq", "brothel", "cafe", "cinema", "food_court",
-                "marketplace", "nightclub", "restaurant", "swinger_club",
-                "theatre", "vending_machine"
-            ];
-            if (recreationList.includes(value)) return iconMap.amenity[value] ?? iconMap.amenity._default;
-            return iconMap.amenity[value] ?? iconMap.amenity._default;
-        }
-
-        // --- Emergency ---
-        if (key === "emergency") return iconMap.emergency[value] ?? iconMap.emergency._default;
-
-        // --- Natural ---
-        if (key === "natural") return iconMap.natural._default;
-
-        // --- Other keys ---
-        if (key in iconMap) return iconMap[key]._default ?? iconMap._global_default._default;
+  for (const [key, value] of Object.entries(tags)) {
+    // --- Amenity ---
+    if (key === "amenity") {
+      const recreationList = [
+        "bar", "bbq", "brothel", "cafe", "cinema", "food_court",
+        "marketplace", "nightclub", "restaurant", "swinger_club",
+        "theatre", "vending_machine"
+      ];
+      if (recreationList.includes(value)) return iconMap.amenity[value] ?? iconMap.amenity._default;
+      return iconMap.amenity[value] ?? iconMap.amenity._default;
     }
 
-    // --- Global fallback ---
-    return iconMap._global_default._default;
+    // --- Emergency ---
+    if (key === "emergency") return iconMap.emergency[value] ?? iconMap.emergency._default;
+
+    // --- Natural ---
+    if (key === "natural") return iconMap.natural._default;
+
+    // --- Other keys ---
+    if (key in iconMap) return iconMap[key]._default ?? iconMap._global_default._default;
+  }
+
+  // --- Global fallback ---
+  return iconMap._global_default._default;
 }
 
 async function processElement(element, iconMap) {
-    /** Compute center, elevation, and height (if any). */
-    const lat = element.points.reduce((acc, p) => acc + p.lat, 0) / element.points.length;
-    const lon = element.points.reduce((acc, p) => acc + p.lon, 0) / element.points.length;
-    const baseElev = await getElevation(lat, lon);
+  /** Compute center, elevation, and height (if any). */
+  const lat = element.points.reduce((acc, p) => acc + p.lat, 0) / element.points.length;
+  const lon = element.points.reduce((acc, p) => acc + p.lon, 0) / element.points.length;
+  const baseElev = await getElevation(lat, lon);
 
-    const heightInfo = isBuilding(element) ? parseHeight(element.tags) : {
-        height: 0.0,
-        min_height: 0.0,
-        effective_height: 0.0 // USE THIS
-    };
+  const heightInfo = isBuilding(element) ? parseHeight(element.tags) : {
+    height: 0.0,
+    min_height: 0.0,
+    effective_height: 0.0 // USE THIS
+  };
 
-    const icon = getIconForElement(element, iconMap);
-    const xy = lonLatToMeters(lon, lat);
+  const icon = getIconForElement(element, iconMap);
+  const xy = lonLatToMeters(lon, lat);
 
-    return {
-        id: element.id,
-        points: element.points,
-        centroid: { lat, lon },
-        xy, // this is the coordinates to use on the map
-        base_elev: baseElev,
-        ...heightInfo,
-        tags: element.tags,
-        icon
-    };
+  return {
+    id: element.id,
+    points: element.points,
+    centroid: { lat, lon },
+    xy, // this is the coordinates to use on the map
+    base_elev: baseElev,
+    ...heightInfo,
+    tags: element.tags,
+    icon
+  };
 }
-        // Abortable fetch helper with timeout (ms)
-        async function abortableFetch(input, init = {}, timeoutMs = 20000) {
-          const controller = new AbortController();
-          const signal = controller.signal;
-          const id = setTimeout(() => controller.abort(), timeoutMs);
-          try {
-            const res = await fetch(input, Object.assign({}, init, { signal }));
-            clearTimeout(id);
-            return res;
-          } catch (err) {
-            clearTimeout(id);
-            throw err;
-          }
-        }
+// Abortable fetch helper with timeout (ms)
+async function abortableFetch(input, init = {}, timeoutMs = 20000) {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(input, Object.assign({}, init, { signal }));
+    clearTimeout(id);
+    return res;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
+}
 
 // Test function to verify icons are working
 function testIconPlacement() {
   // Clear existing icons
   clearIconMarkers();
-  
+
   // Add test icons at known locations
   const testLocations = [
     { lat: 40.7128, lon: -74.0060, name: "New York" },
@@ -1131,7 +1173,7 @@ function testIconPlacement() {
     { lat: 35.6762, lon: 139.6503, name: "Tokyo" },
     { lat: -33.8688, lon: 151.2093, name: "Sydney" }
   ];
-  
+
   testLocations.forEach(location => {
     addIconMarker(
       location.lat,
@@ -1140,7 +1182,7 @@ function testIconPlacement() {
       0.02
     );
   });
-  
+
   console.log('Test icons placed at known locations');
   setStatus('Test icons placed - check console for errors', 'info', 5000);
 }
@@ -1152,10 +1194,10 @@ function testIconPlacement() {
 // Main entry point
 // -----------------------------------------------------------
 async function getOsmJson(lat, lon, radius = 500) {
-    // radius = 500 is the default, can be overwritten by passing a different value
-    if (inOverpassCooldown()) throw new Error('Overpass cooldown active');
-    const overpassUrl = "https://overpass-api.de/api/interpreter";
-    const query = `
+  // radius = 500 is the default, can be overwritten by passing a different value
+  if (inOverpassCooldown()) throw new Error('Overpass cooldown active');
+  const overpassUrl = "https://overpass-api.de/api/interpreter";
+  const query = `
         [out:json];
         (
           node(around:${radius},${lat},${lon});
@@ -1167,53 +1209,53 @@ async function getOsmJson(lat, lon, radius = 500) {
         out skel qt;
     `;
 
-    // Retry with small backoff on transient failures (including occasional 429)
-    const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const response = await fetch(overpassUrl, {
-          method: "POST",
-          body: query
-        });
-        if (!response.ok) {
-          if (response.status === 429) {
-            // respect server rate-limit
-            overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
-            setStatus('Overpass rate limit: delaying icon load for 60s', 'error', 8000);
-            throw new Error(`Overpass rate limited (429)`);
-          }
-          const txt = await response.text();
-          throw new Error(`HTTP error! status: ${response.status} - ${txt}`);
+  // Retry with small backoff on transient failures (including occasional 429)
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(overpassUrl, {
+        method: "POST",
+        body: query
+      });
+      if (!response.ok) {
+        if (response.status === 429) {
+          // respect server rate-limit
+          overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+          setStatus('Overpass rate limit: delaying icon load for 60s', 'error', 8000);
+          throw new Error(`Overpass rate limited (429)`);
         }
-        return await response.json();
-      } catch (err) {
-        console.warn(`Overpass attempt ${attempt} failed:`, err.message || err);
-        if (attempt < maxAttempts) {
-          const backoff = attempt === 1 ? 1500 : 4000;
-          await new Promise(r => setTimeout(r, backoff));
-          continue;
-        }
-        throw err;
+        const txt = await response.text();
+        throw new Error(`HTTP error! status: ${response.status} - ${txt}`);
       }
+      return await response.json();
+    } catch (err) {
+      console.warn(`Overpass attempt ${attempt} failed:`, err.message || err);
+      if (attempt < maxAttempts) {
+        const backoff = attempt === 1 ? 1500 : 4000;
+        await new Promise(r => setTimeout(r, backoff));
+        continue;
+      }
+      throw err;
     }
+  }
 }
 
 
 async function processOsmJson(jsonString) {
-    /**
-     * Process a full OSM JSON string.
-     * Returns a unified list of all elements, each with:
-     * - id, points, center, xy, base_elev
-     * - height/min_height/effective_height (if any)
-     * - tags
-     */
-    const osmData = JSON.parse(jsonString);
-    const allElements = extractElements(osmData);
-    const processed = [];
-    for (const el of allElements) {
-        processed.push(await processElement(el, ICON_MAP));
-    }
-    return processed;
+  /**
+   * Process a full OSM JSON string.
+   * Returns a unified list of all elements, each with:
+   * - id, points, center, xy, base_elev
+   * - height/min_height/effective_height (if any)
+   * - tags
+   */
+  const osmData = JSON.parse(jsonString);
+  const allElements = extractElements(osmData);
+  const processed = [];
+  for (const el of allElements) {
+    processed.push(await processElement(el, ICON_MAP));
+  }
+  return processed;
 }
 
 // -----------------------------------------------------------
@@ -1246,19 +1288,19 @@ let iconMarkers = [];
 function addIconMarker(lat, lon, imageUrl, elevation) {
   // Use the same coordinate system as your globe (radius = 1)
   const radius = (modelScaledRadius || RADIUS) + 0.02; // Slightly above surface + elevation offset
-  
+
   // Use your existing latLonToVector3 function for consistency
   const position = latLonToVector3(lat, lon, radius);
   console.log(`Loading icon from: ${imageUrl}`);
   console.log(`Full URL would be: ${new URL(imageUrl, window.location.origin).href}`);
-  
+
   // Create a sprite for the icon with proper error handling
   const textureLoader = new THREE.TextureLoader();
   textureLoader.load(
     imageUrl,
     (texture) => {
-      const material = new THREE.SpriteMaterial({ 
-        map: texture, 
+      const material = new THREE.SpriteMaterial({
+        map: texture,
         transparent: true,
         depthTest: true,
         depthWrite: false
@@ -1269,10 +1311,10 @@ function addIconMarker(lat, lon, imageUrl, elevation) {
       const scale = 0.05; // Experiment with this value
       sprite.scale.set(scale, scale, 1);
       sprite.position.copy(position);
-      
+
       // Ensure icons render above other geometry
       sprite.renderOrder = 1;
-      
+
       scene.add(sprite);
       iconMarkers.push(sprite);
       console.log(`Icon placed at (${lat}, ${lon})`);
@@ -1310,90 +1352,90 @@ function clearIconMarkers() {
 
 
 const ICON_MAP = {
-    "amenity": { 
-        "bar": "/static/icons/amenity_recreational.svg",
-        "bbq": "/static/icons/amenity_recreational.svg",
-        "brothel": "/static/icons/amenity_recreational.svg",
-        "cafe": "/static/icons/amenity_recreational.svg",
-        "cinema": "/static/icons/amenity_recreational.svg",
-        "food_court": "/static/icons/amenity_recreational.svg",
-        "marketplace": "/static/icons/amenity_recreational.svg",
-        "nightclub": "/static/icons/amenity_recreational.svg",
-        "restaurant": "/static/icons/amenity_recreational.svg",
-        "swinger_club": "/static/icons/amenity_recreational.svg",
-        "theatre": "/static/icons/amenity_recreational.svg",
-        "vending_machine": "/static/icons/amenity_recreational.svg",
-        "bicycle_parking": "/static/icons/amenity_vehicle.svg",
-        "bicycle_rental": "/static/icons/amenity_vehicle.svg",
-        "car_rental": "/static/icons/amenity_vehicle.svg",
-        "car_sharing": "/static/icons/amenity_vehicle.svg",
-        "fuel": "/static/icons/amenity_vehicle.svg",
-        "parking": "/static/icons/amenity_vehicle.svg",
-        "charging_station": "/static/icons/amenity_charging_station.svg",
-        "clinic": "/static/icons/health.svg",
-        "dentist": "/static/icons/health.svg",
-        "doctors": "/static/icons/health.svg",
-        "hospital": "/static/icons/health.svg",
-        "pharmacy": "/static/icons/health.svg",
-        "college": "/static/icons/amenity_education.svg",
-        "kindergarten": "/static/icons/amenity_education.svg",
-        "school": "/static/icons/amenity_education.svg",
-        "courthouse": "/static/icons/amenity_public_building.svg",
-        "fire_station": "/static/icons/emergency_fire_station.svg",
-        "police": "/static/icons/emergency_police.svg",
-        "ferry_terminal": "/static/icons/amenity_ferry_terminal.svg",
-        "grave_yard": "/static/icons/amenity_grave_yard.svg",
-        "library": "/static/icons/amenity_library.svg",
-        "place_of_worship": "/static/icons/amenity_place_of_worship.svg",
-        "post_box": "/static/icons/amenity_post.svg",
-        "post_office": "/static/icons/amenity_post.svg",
-        "prison": "/static/icons/amenity_prison.svg",
-        "public_building": "/static/icons/amenity_public_building.svg",
-        "recycling": "/static/icons/amenity_recycling.svg",
-        "shelter": "/static/icons/amenity_shelter.svg",
-        "taxi": "/static/icons/amenity_taxi.svg",
-        "telephone": "/static/icons/amenity_telephone.svg",
-        "toilets": "/static/icons/amenity_toilets.svg",
-        "townhall": "/static/icons/amenity_public_building.svg",
-        "drinking_water": "/static/icons/water.svg",
-        "water_point": "/static/icons/water.svg",
-        "_default": "/static/icons/amenity.svg"
-    },
-    "natural": { "_default": "/static/icons/natural.svg" },
-    "emergency": {
-        "ambulance_station": "/static/icons/emergency_ambulance_station.svg",
-        "fire_station": "/static/icons/emergency_fire_station.svg",
-        "lifeguard_station": "/static/icons/emergency_lifeguard_station.svg",
-        "police": "/static/icons/emergency_police.svg",
-        "first_aid": "/static/icons/emergency_first_aid.svg",
-        "defibrillator": "/static/icons/emergency_first_aid.svg",
-        "assembly_point": "/static/icons/emergency_assembly_point.svg",
-        "_default": "/static/icons/emergency.svg"
-    },
-    "aerialway":   { "_default": "/static/icons/aerialway.svg" },
-    "aeroway":     { "_default": "/static/icons/aerialway.svg" },
-    "barrier":     { "_default": "/static/icons/barrier.svg" },
-    "boundary":    { "_default": "/static/icons/barrier.svg" },
-    "building":    { "_default": "/static/icons/building.svg" },
-    "craft":       { "_default": "/static/icons/craft.svg" },
-    "geological":  { "_default": "/static/icons/geological.svg" },
-    "healthcare":  { "_default": "/static/icons/health.svg" },
-    "highway":     { "_default": "/static/icons/highway.svg" },
-    "historic":    { "_default": "/static/icons/historic.svg" },
-    "landuse":     { "_default": "/static/icons/landuse.svg" },
-    "leisure":     { "_default": "/static/icons/leisure.svg" },
-    "man_made":    { "_default": "/static/icons/man_made.svg" },
-    "military":    { "_default": "/static/icons/military.svg" },
-    "office":      { "_default": "/static/icons/office.svg" },
-    "place":       { "_default": "/static/icons/place.svg" },
-    "power":       { "_default": "/static/icons/power.svg" },
-    "public_transport": { "_default": "/static/icons/public_transport.svg" },
-    "railway":     { "_default": "/static/icons/route.svg" },
-    "route":       { "_default": "/static/icons/route.svg" },
-    "shop":        { "_default": "/static/icons/shop.svg" },
-    "telecom":     { "_default": "/static/icons/telecom.svg" },
-    "tourism":     { "_default": "/static/icons/tourism.svg" },
-    "water":       { "_default": "/static/icons/water.svg" },
-    "waterway":    { "_default": "/static/icons/water.svg" },
-    "_global_default": { "_default": "/static/icons/default.svg" }
+  "amenity": {
+    "bar": "/static/icons/amenity_recreational.svg",
+    "bbq": "/static/icons/amenity_recreational.svg",
+    "brothel": "/static/icons/amenity_recreational.svg",
+    "cafe": "/static/icons/amenity_recreational.svg",
+    "cinema": "/static/icons/amenity_recreational.svg",
+    "food_court": "/static/icons/amenity_recreational.svg",
+    "marketplace": "/static/icons/amenity_recreational.svg",
+    "nightclub": "/static/icons/amenity_recreational.svg",
+    "restaurant": "/static/icons/amenity_recreational.svg",
+    "swinger_club": "/static/icons/amenity_recreational.svg",
+    "theatre": "/static/icons/amenity_recreational.svg",
+    "vending_machine": "/static/icons/amenity_recreational.svg",
+    "bicycle_parking": "/static/icons/amenity_vehicle.svg",
+    "bicycle_rental": "/static/icons/amenity_vehicle.svg",
+    "car_rental": "/static/icons/amenity_vehicle.svg",
+    "car_sharing": "/static/icons/amenity_vehicle.svg",
+    "fuel": "/static/icons/amenity_vehicle.svg",
+    "parking": "/static/icons/amenity_vehicle.svg",
+    "charging_station": "/static/icons/amenity_charging_station.svg",
+    "clinic": "/static/icons/health.svg",
+    "dentist": "/static/icons/health.svg",
+    "doctors": "/static/icons/health.svg",
+    "hospital": "/static/icons/health.svg",
+    "pharmacy": "/static/icons/health.svg",
+    "college": "/static/icons/amenity_education.svg",
+    "kindergarten": "/static/icons/amenity_education.svg",
+    "school": "/static/icons/amenity_education.svg",
+    "courthouse": "/static/icons/amenity_public_building.svg",
+    "fire_station": "/static/icons/emergency_fire_station.svg",
+    "police": "/static/icons/emergency_police.svg",
+    "ferry_terminal": "/static/icons/amenity_ferry_terminal.svg",
+    "grave_yard": "/static/icons/amenity_grave_yard.svg",
+    "library": "/static/icons/amenity_library.svg",
+    "place_of_worship": "/static/icons/amenity_place_of_worship.svg",
+    "post_box": "/static/icons/amenity_post.svg",
+    "post_office": "/static/icons/amenity_post.svg",
+    "prison": "/static/icons/amenity_prison.svg",
+    "public_building": "/static/icons/amenity_public_building.svg",
+    "recycling": "/static/icons/amenity_recycling.svg",
+    "shelter": "/static/icons/amenity_shelter.svg",
+    "taxi": "/static/icons/amenity_taxi.svg",
+    "telephone": "/static/icons/amenity_telephone.svg",
+    "toilets": "/static/icons/amenity_toilets.svg",
+    "townhall": "/static/icons/amenity_public_building.svg",
+    "drinking_water": "/static/icons/water.svg",
+    "water_point": "/static/icons/water.svg",
+    "_default": "/static/icons/amenity.svg"
+  },
+  "natural": { "_default": "/static/icons/natural.svg" },
+  "emergency": {
+    "ambulance_station": "/static/icons/emergency_ambulance_station.svg",
+    "fire_station": "/static/icons/emergency_fire_station.svg",
+    "lifeguard_station": "/static/icons/emergency_lifeguard_station.svg",
+    "police": "/static/icons/emergency_police.svg",
+    "first_aid": "/static/icons/emergency_first_aid.svg",
+    "defibrillator": "/static/icons/emergency_first_aid.svg",
+    "assembly_point": "/static/icons/emergency_assembly_point.svg",
+    "_default": "/static/icons/emergency.svg"
+  },
+  "aerialway": { "_default": "/static/icons/aerialway.svg" },
+  "aeroway": { "_default": "/static/icons/aerialway.svg" },
+  "barrier": { "_default": "/static/icons/barrier.svg" },
+  "boundary": { "_default": "/static/icons/barrier.svg" },
+  "building": { "_default": "/static/icons/building.svg" },
+  "craft": { "_default": "/static/icons/craft.svg" },
+  "geological": { "_default": "/static/icons/geological.svg" },
+  "healthcare": { "_default": "/static/icons/health.svg" },
+  "highway": { "_default": "/static/icons/highway.svg" },
+  "historic": { "_default": "/static/icons/historic.svg" },
+  "landuse": { "_default": "/static/icons/landuse.svg" },
+  "leisure": { "_default": "/static/icons/leisure.svg" },
+  "man_made": { "_default": "/static/icons/man_made.svg" },
+  "military": { "_default": "/static/icons/military.svg" },
+  "office": { "_default": "/static/icons/office.svg" },
+  "place": { "_default": "/static/icons/place.svg" },
+  "power": { "_default": "/static/icons/power.svg" },
+  "public_transport": { "_default": "/static/icons/public_transport.svg" },
+  "railway": { "_default": "/static/icons/route.svg" },
+  "route": { "_default": "/static/icons/route.svg" },
+  "shop": { "_default": "/static/icons/shop.svg" },
+  "telecom": { "_default": "/static/icons/telecom.svg" },
+  "tourism": { "_default": "/static/icons/tourism.svg" },
+  "water": { "_default": "/static/icons/water.svg" },
+  "waterway": { "_default": "/static/icons/water.svg" },
+  "_global_default": { "_default": "/static/icons/default.svg" }
 };

@@ -195,11 +195,12 @@ class AIService:
 
 # ----- Simple test harness -----
 async def main_demo():
-    adapters = {
-        "gemini": GeminiAdapter(api_key="dummy", concurrency=2),
-        "local": LocalProcessAdapter(cmd="./local_model", concurrency=1),
-    }
-    svc = AIService(adapters=adapters, worker_count=6)
+    # adapters = {
+    #     "gemini": GeminiAdapter(api_key="dummy", concurrency=2)
+    #     # "local": LocalProcessAdapter(cmd="./local_model", concurrency=1),
+    # }
+
+    svc = AIService(GeminiAdapter(api_key="AIzaSyBQ7eKuefURDF7CA7mhT4Oe_ntu2ruLiMk", concurrency=2), worker_count=6)
     await svc.start()
 
     async def make_query(prompt, model):
@@ -209,14 +210,14 @@ async def main_demo():
         except Exception as e:
             print("ERR:", e)
 
-    tasks = []
-    for i in range(20):
-        model = "gemini"
-        tasks.append(asyncio.create_task(make_query(f"Question {i}", model)))
+    # tasks = []
+    # for i in range(20):
+    #     model = "gemini"
+    #     tasks.append(asyncio.create_task(make_query(f"Question {i}", model)))
 
-    await asyncio.gather(*tasks)
-    await svc.stop()
-    print("Metrics:", svc.metrics)
+    # await asyncio.gather(*tasks)
+    # await svc.stop()
+    # print("Metrics:", svc.metrics)
 
-if __name__ == "__main__":
-    asyncio.run(main_demo())
+# if __name__ == "__main__":
+#     asyncio.run(main_demo())
