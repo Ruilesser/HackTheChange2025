@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Globe Map</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.158.0/build/three.module.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="map-root">
+      <div id="map-container"></div>
+      <div id="ui">
+        <button id="load-osm">Load reconstruction (London 5 km)</button>
+        <button id="locate-me" style="margin-left:8px">Locate me</button>
+        <span id="status" aria-live="polite" style="margin-left:12px;color:#ddd"></span>
+      </div>
+    </div>
+
+    <!-- map.js is an ES module that imports Three.js from CDN -->
+    <script type="module" src="{{ url_for('static', filename='js/map.js') }}"></script>
+  </body>
+</html>
