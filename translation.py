@@ -190,8 +190,12 @@ ICON_MAP = {
         "vending_machine": "icons/amenity_recreational.svg",
 
         # --- Other amenities with value-specific icons ---
-        "bicycle_parking": "icons/amenity_bicycle.svg",
-        "bicycle_rental": "icons/amenity_bicycle.svg",
+        "bicycle_parking": "icons/amenity_vehicle.svg",
+        "bicycle_rental": "icons/amenity_vehicle.svg",
+        "car_rental": "icons/amenity_vehicle.svg",
+        "car_sharing": "icons/amenity_vehicle.svg",
+        "fuel": "icons/amenity_vehicle.svg",
+        "parking": "icons/amenity_vehicle.svg",
 
         "charging_station": "icons/amenity_charging_station.svg",
 
@@ -205,14 +209,10 @@ ICON_MAP = {
         "kindergarten": "icons/amenity_education.svg",
         "school": "icons/amenity_education.svg",
 
-        "courthouse": "icons/amenity_courthouse.svg",
+        "courthouse": "icons/amenity_public_building.svg",
         "fire_station": "icons/emergency_fire_station.svg",
         "police": "icons/emergency_police.svg",
 
-        "car_rental": "icons/amenity_car.svg",
-        "car_sharing": "icons/amenity_car.svg",
-        "fuel": "icons/amenity_car.svg",
-        "parking": "icons/amenity_car.svg",
 
         "ferry_terminal": "icons/amenity_ferry_terminal.svg",
         "grave_yard": "icons/amenity_grave_yard.svg",
@@ -231,10 +231,10 @@ ICON_MAP = {
 
         "telephone": "icons/amenity_telephone.svg",
         "toilets": "icons/amenity_toilets.svg",
-        "townhall": "icons/amenity_townhall.svg",
+        "townhall": "icons/amenity_public_building.svg",
 
-        "drinking_water": "icons/amenity_water.svg",
-        "water_point": "icons/amenity_water.svg",
+        "drinking_water": "icons/water.svg",
+        "water_point": "icons/water.svg",
 
         # --- Fallback for any other amenity ---
         "_default": "icons/amenity.svg"
@@ -259,9 +259,9 @@ ICON_MAP = {
 
     # ------------------- OTHER KEYS (generic default per key) -------------------
     "aerialway":   {"_default": "icons/aerialway.svg"},
-    "aeroway":     {"_default": "icons/aeroway.svg"},
+    "aeroway":     {"_default": "icons/aerialway.svg"},
     "barrier":     {"_default": "icons/barrier.svg"},
-    "boundary":    {"_default": "icons/boundary.svg"},
+    "boundary":    {"_default": "icons/barrier.svg"},
     "building":    {"_default": "icons/building.svg"},
     "craft":       {"_default": "icons/craft.svg"},
     "geological":  {"_default": "icons/geological.svg"},
@@ -276,13 +276,13 @@ ICON_MAP = {
     "place":       {"_default": "icons/place.svg"},
     "power":       {"_default": "icons/power.svg"},
     "public_transport": {"_default": "icons/public_transport.svg"},
-    "railway":     {"_default": "icons/railway.svg"},
+    "railway":     {"_default": "icons/route.svg"},
     "route":       {"_default": "icons/route.svg"},
     "shop":        {"_default": "icons/shop.svg"},
     "telecom":     {"_default": "icons/telecom.svg"},
     "tourism":     {"_default": "icons/tourism.svg"},
     "water":       {"_default": "icons/water.svg"},
-    "waterway":    {"_default": "icons/waterway.svg"},
+    "waterway":    {"_default": "icons/water.svg"},
     
     # ------------------- GLOBAL FALLBACK -------------------
     "_global_default": {"_default": "icons/default.svg"}
