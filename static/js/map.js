@@ -34,6 +34,16 @@ debugOverlay.style.pointerEvents = 'none';
 debugOverlay.innerHTML = '';
 container.appendChild(debugOverlay);
 
+// Enable verbose logging for country outline streaming when debugging
+const DEBUG_COUNTRY_STREAM = true;
+
+// OSM / elevation controls
+let lastOsmElementsCount = 0; // number of elements in last OSM payload
+const ELEVATION_ENABLED = true; // set false to disable elevation lookups entirely
+const ELEVATION_BATCH_THRESHOLD = 5000; // skip per-element elevation if payload larger than this
+// maximum radius (meters) for fetching detailed OSM icons — prevents huge requests
+const ICON_OSM_RADIUS_MAX = 3000;
+
 // debug overlay updater (throttled)
 let lastDebugUpdate = 0;
 const DEBUG_UPDATE_MS = 500;
@@ -234,6 +244,8 @@ function scheduleOverpassFetch(lat, lon, radius) {
 const spriteLabels = []; // array of sprites
 // index to deduplicate labels by name or centroid key -> sprite
 const spriteLabelIndex = new Map();
+// icon markers (sprites/meshes) placed for OSM features — declared early to avoid TDZ
+let iconMarkers = [];
 
 // Clear only OSM feature layers (keep country borders and labels intact)
 function clearFeatures() {
@@ -450,6 +462,11 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       // expect feature with geometry LineString/MultiLineString
       const geom = obj.geometry;
       if (!geom) continue;
+      if (DEBUG_COUNTRY_STREAM) {
+        try {
+          console.debug('countries_stream: parsed feature', { type: geom.type, props: obj.properties && Object.keys(obj.properties).slice(0,5) });
+        } catch (e) {}
+      }
       // culling: determine representative lat/lon for geometry (server may have added centroid)
       let repLat = null, repLon = null;
       if (obj.properties && obj.properties.centroid && obj.properties.centroid.length >= 2) {
@@ -463,16 +480,26 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
         const worldPos = latLonToVector3(repLat, repLon, (modelScaledRadius || RADIUS) + 0.006);
         // backface: check facing relative to camera direction
         const toPoint = worldPos.clone().sub(camera.position).normalize();
-        if (toPoint.dot(camDir) <= 0) continue; // behind globe
+        const dot = toPoint.dot(camDir);
+        const inFrustum = frustum.containsPoint(worldPos);
+        if (DEBUG_COUNTRY_STREAM) {
+          console.debug('countries_stream: cull-check', { repLat, repLon, dot, inFrustum });
+        }
+        if (dot <= 0) continue; // behind globe
         // frustum test: skip if outside view frustum
-        if (!frustum.containsPoint(worldPos)) continue;
+        if (!inFrustum) continue;
       }
       if (geom.type === 'LineString') {
         renderCountryLine(geom.coordinates, 0xffffff, 1, countryBordersPending);
         addedCountryGeoms++;
+        if (DEBUG_COUNTRY_STREAM && addedCountryGeoms <= 20) console.debug('countries_stream: added segment', { idx: addedCountryGeoms, points: geom.coordinates.length });
         if (addedCountryGeoms % 40 === 0) setStatus(`Loading country outlines… ${addedCountryGeoms} segments rendered`, 'loading', null);
       } else if (geom.type === 'MultiLineString') {
-        for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1, countryBordersPending);
+        for (const part of geom.coordinates) {
+          renderCountryLine(part, 0xffffff, 1, countryBordersPending);
+          addedCountryGeoms++;
+          if (DEBUG_COUNTRY_STREAM && addedCountryGeoms <= 20) console.debug('countries_stream: added segment (multi)', { idx: addedCountryGeoms, points: part.length });
+        }
       }
       // collect label info and add label (country name)
       if (obj.properties && obj.properties.name) {
@@ -739,7 +766,7 @@ async function fetchOverpass(lat, lon, radiusMeters) {
       const res = await abortableFetch(`/api/overpass?${qs.toString()}`, { method: 'GET' }, 25000);
       if (!res.ok) {
         // handle rate-limit specially
-        if (res.status === 429) {
+        if (res.status === 429 || res.status === 504) {
           overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
           // remove cache so we can retry later
           try { overpassCache.delete(cacheKey); } catch (e) {}
@@ -879,14 +906,14 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
         }
         if (obj._error) {
           console.warn('Overpass tile error', obj);
-          // If server reports Overpass rate limiting (429) for a tile, pause further Overpass queries
+          // If server reports Overpass rate limiting (429) or gateway timeout (504) for a tile, pause further Overpass queries
           try {
             const details = String(obj.details || '').toLowerCase();
-            if (details.includes('429') || details.includes('too many requests')) {
+            if (details.includes('429') || details.includes('too many requests') || details.includes('504') || details.includes('gateway')) {
               overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
               // remove cache entry so we can retry after cooldown rather than being blocked
               try { overpassCache.delete(cacheKey); } catch (e) {}
-              setStatus('Overpass rate limit reached (tile requests) — pausing for 60s', 'error', 8000);
+              setStatus('Overpass rate limit or server timeout reached (tile requests) — pausing for 60s', 'error', 8000);
               return; // stop processing the stream
             }
           } catch (e) {
@@ -977,36 +1004,12 @@ document.getElementById('locate-me').addEventListener('click', () => {
   navigator.geolocation.getCurrentPosition((pos) => {
     const lat = pos.coords.latitude;
     const lon = pos.coords.longitude;
-    centerOnLatLon(lat, lon, 3.0);
-
-    clearIconMarkers(); // clear icons
-
-    // initial fetch uses radius based on current camera distance
-  const dist = camera.position.distanceTo(controls.target || new THREE.Vector3());
-  const radius = cameraDistanceToRadius(dist);
-  // schedule via throttler
-  scheduleOverpassFetch(lat, lon, radius);
+    // smooth fly-to the location, then request visible data (LOD/streaming/icons)
+    clearIconMarkers();
+    flyToLatLon(lat, lon, 3.0, 900, () => {
+      try { requestVisibleData(lat, lon, { immediate: true }); } catch (e) { console.warn('locate-me: requestVisibleData failed', e); }
+    });
     clearStatus();
-
-    // THIS CODE HERE is for adding icons onto the map
-    getOsmJson(lat, lon, radius)
-      .then(osmData => processOsmJson(JSON.stringify(osmData)))
-      .then(processedElements => {
-        for (const el of processedElements) {
-          // CORRECT ORDER: lat, lon, imageUrl, elevation
-          addIconMarker(
-            el.centroid.lat,
-            el.centroid.lon,
-            el.icon || '/static/icons/default.svg',
-            (el.effective_height || 0) * 0.0001 // Small elevation offset
-          );
-        }
-        console.log(`Added ${processedElements.length} icon markers`);
-      })
-      .catch(err => {
-        console.error('Error processing OSM data for icons:', err);
-        setStatus('Error loading OSM icons', 'error', 5000);
-      });
 
   }, (err) => {
     clearStatus();
@@ -1090,6 +1093,93 @@ function shouldFetchCountries(newLat, newLon, newRadius, newSimplify) {
   return metersMoved > 2000 || simplifyChanged;
 }
 
+/**
+ * Centralized request pipeline for visible data (Overpass features, country outlines, icons).
+ * Accepts a lat/lon (sub-satellite) or null to use current controls target. Computes radius
+ * from camera distance, throttles/uses cache where appropriate, and triggers streaming
+ * country outlines and Overpass requests. Also triggers icon loading at high LOD when
+ * the requested radius is small enough.
+ */
+async function requestVisibleData(lat = null, lon = null, options = {}) {
+  // determine center lat/lon if not provided
+  let centerLat = lat, centerLon = lon;
+  if (centerLat === null || centerLon === null) {
+    const sub = getSubSatelliteLatLon() || {};
+    centerLat = sub.lat; centerLon = sub.lon;
+  }
+
+  // build target vector for distance/radius calculation
+  let targetVec = null;
+  if (typeof centerLat === 'number' && typeof centerLon === 'number') targetVec = latLonToVector3(centerLat, centerLon, modelScaledRadius || RADIUS);
+  else targetVec = controls.target.clone();
+
+  const dist = camera.position.distanceTo(targetVec);
+  const radius = cameraDistanceToRadius(dist);
+
+  // Overpass fetch for OSM features (throttled via scheduleOverpassFetch)
+  try {
+    if (shouldFetch(centerLat, centerLon, radius)) {
+      lastFetch = { lat: centerLat, lon: centerLon, radius };
+      scheduleOverpassFetch(centerLat, centerLon, radius);
+    }
+  } catch (e) {
+    console.warn('requestVisibleData: overpass scheduling failed', e);
+  }
+
+  // Country outlines streaming with computed simplify
+  try {
+    const simplify = computeSimplifyForRadius(radius);
+    if (shouldFetchCountries(centerLat, centerLon, radius, simplify)) {
+      lastCountriesFetch = { lat: centerLat, lon: centerLon, radius, simplify };
+      fetchCountriesStream({ lat: centerLat, lon: centerLon, radius, simplify }).catch(err => console.warn('countries stream error', err));
+    }
+  } catch (e) {
+    console.warn('requestVisibleData: country stream failed', e);
+  }
+
+  // Icon loading: only when zoomed sufficiently (avoid huge Overpass responses)
+  try {
+    if (radius <= ICON_OSM_RADIUS_MAX) {
+      // ensure existing icons are cleared (caller may already have cleared)
+      clearIconMarkers();
+      // load and place icons (this will add sprite markers)
+      loadOsmFeaturesAt(centerLat, centerLon, radius).catch(err => {
+        console.warn('Failed to load OSM features for icons', err);
+        setStatus('Failed to load icons', 'error', 4000);
+      });
+    } else {
+      if (!options || !options.silent) setStatus('Skipping icon load: area too large—zoom in to load icons', 'info', 4000);
+    }
+  } catch (e) {
+    console.warn('requestVisibleData: icon load failed', e);
+  }
+}
+
+// Update icon sprites/markers each frame so they keep reasonable pixel sizes
+function updateIconMarkers() {
+  if (!iconMarkers || iconMarkers.length === 0) return;
+  const camDir = new THREE.Vector3();
+  camera.getWorldDirection(camDir);
+  for (const m of iconMarkers) {
+    if (!m) continue;
+    const wp = m.position || (m.userData && m.userData.worldPos) || null;
+    if (!wp) continue;
+    const toPoint = wp.clone().sub(camera.position).normalize();
+    const facing = toPoint.dot(camDir) > 0.05;
+    m.visible = !!facing;
+    // scale by distance so icons are legible at different zooms
+    const dist = camera.position.distanceTo(wp) || 1;
+    const base = m.userData && m.userData.baseScale ? m.userData.baseScale : 0.08;
+    const scale = Math.min(Math.max(base * (dist * 0.12), 0.02), 0.3);
+    try {
+      if (m.type === 'Sprite') m.scale.set(scale, scale, 1);
+      else m.scale && m.scale.set && m.scale.set(scale, scale, scale);
+      // ensure icon materials respect depthTest so they can be occluded by globe when behind
+      if (m.material && typeof m.material.depthTest !== 'undefined') m.material.depthTest = true;
+    } catch (e) { /* ignore scale errors */ }
+  }
+}
+
 // center camera and controls target on lat/lon; factor controls camera distance multiplier
 function centerOnLatLon(lat, lon, distanceFactor = 3.5) {
   const target = latLonToVector3(lat, lon, modelScaledRadius || RADIUS);
@@ -1098,6 +1188,30 @@ function centerOnLatLon(lat, lon, distanceFactor = 3.5) {
   const camPos = target.clone().multiplyScalar(distanceFactor);
   camera.position.copy(camPos);
   controls.update();
+}
+
+// Smooth camera fly-to (animates camera position and controls.target)
+function flyToLatLon(lat, lon, distanceFactor = 3.5, duration = 900, onComplete) {
+  try {
+    const startPos = camera.position.clone();
+    const startTarget = controls.target.clone();
+    const endTarget = latLonToVector3(lat, lon, modelScaledRadius || RADIUS);
+    const endCamPos = endTarget.clone().multiplyScalar(distanceFactor);
+    const t0 = performance.now();
+    function step() {
+      const t = Math.min(1, (performance.now() - t0) / duration);
+      // easeOutCubic
+      const e = 1 - Math.pow(1 - t, 3);
+      camera.position.lerpVectors(startPos, endCamPos, e);
+      controls.target.lerpVectors(startTarget, endTarget, e);
+      controls.update();
+      if (t < 1) requestAnimationFrame(step);
+      else {
+        try { if (typeof onComplete === 'function') onComplete(); } catch (e) { /* ignore */ }
+      }
+    }
+    requestAnimationFrame(step);
+  } catch (e) { console.warn('flyToLatLon failed', e); if (typeof onComplete === 'function') onComplete(); }
 }
 
 // debounce/fetch-on-end logic
@@ -1122,34 +1236,14 @@ function scheduleFetchForControls() {
       setStatus(`Overpass rate limit active — waiting ${remaining}s before retrying`, 'error', 4000);
       return;
     }
-    const sub = getSubSatelliteLatLon();
-    const { lat, lon } = sub || { lat: null, lon: null };
-    // build a target vector for distance/radius calculation
-    let targetVec = null;
-    if (lat !== null && lon !== null) {
-      targetVec = latLonToVector3(lat, lon, modelScaledRadius || RADIUS);
-    } else {
-      targetVec = controls.target.clone();
-    }
-    const dist = camera.position.distanceTo(targetVec);
-    const radius = cameraDistanceToRadius(dist);
-    if (shouldFetch(lat, lon, radius)) {
-      lastFetch = { lat, lon, radius };
-      // use scheduled/throttled fetch to avoid spamming Overpass
-      scheduleOverpassFetch(lat, lon, radius);
-    }
-
-    // Adaptive country-outline LOD: request a simplified country stream for
-    // the current sub-satellite area when it changed meaningfully.
+    // delegate to unified requester which computes LOD, schedules streaming
+    // and optionally fetches icons. This centralizes the fetching logic.
     try {
-      const simplify = computeSimplifyForRadius(radius);
-      if (shouldFetchCountries(lat, lon, radius, simplify)) {
-        lastCountriesFetch = { lat, lon, radius, simplify };
-        // fetch incrementally and render country outlines for visible area
-        fetchCountriesStream({ lat, lon, radius, simplify }).catch(err => console.warn('countries stream error', err));
-      }
+      const sub = getSubSatelliteLatLon();
+      const { lat, lon } = sub || { lat: null, lon: null };
+      requestVisibleData(lat, lon);
     } catch (e) {
-      // ignore country fetch errors here
+      console.warn('scheduleFetchForControls: requestVisibleData failed', e);
     }
   }, 600);
 }
@@ -1189,6 +1283,8 @@ function animate() {
   renderer.render(scene, camera);
   // update labels after render to ensure camera/projection are current
   updateLabelSprites();
+  // update icon sprite scales/visibility to maintain readable size
+  updateIconMarkers();
 
   // compute ms stats
   let avg = 0, min = Infinity, max = 0;
@@ -1418,14 +1514,21 @@ async function processElement(element, iconMap) {
         const lat = element.points.reduce((acc, p) => acc + p.lat, 0) / element.points.length;
         const lon = element.points.reduce((acc, p) => acc + p.lon, 0) / element.points.length;
         
-        // Get elevation with error handling
-        let baseElev = 0.0;
-        try {
-            baseElev = await getElevation(lat, lon);
-        } catch (elevErr) {
-            console.warn(`Elevation API failed for (${lat}, ${lon}):`, elevErr);
-            baseElev = 0.0;
+    // Get elevation with error handling. Skip expensive elevation lookups for very large OSM payloads.
+    let baseElev = 0.0;
+    try {
+      if (ELEVATION_ENABLED && lastOsmElementsCount > 0 && lastOsmElementsCount <= ELEVATION_BATCH_THRESHOLD) {
+        baseElev = await getElevation(lat, lon);
+      } else {
+        if (lastOsmElementsCount > ELEVATION_BATCH_THRESHOLD) {
+          if (DEBUG_COUNTRY_STREAM) console.warn('Skipping per-element elevation due to large OSM payload', lastOsmElementsCount);
         }
+        baseElev = 0.0;
+      }
+    } catch (elevErr) {
+      console.warn(`Elevation API failed for (${lat}, ${lon}):`, elevErr);
+      baseElev = 0.0;
+    }
         
         const heightInfo = isBuilding(element) ? parseHeight(element.tags) : {
             height: 0.0,
@@ -1557,10 +1660,26 @@ async function processOsmJson(jsonString) {
      */
     try {
         const osmData = JSON.parse(jsonString);
-        console.log('OSM Data structure:', {
-            elementsCount: osmData.elements?.length || 0,
-            elementTypes: [...new Set(osmData.elements?.map(el => el.type) || [])]
-        });
+        // detect Overpass error payloads (e.g., tile_too_large)
+        if (osmData && osmData._error) {
+            console.warn('Overpass returned error for OSM query:', osmData);
+            setStatus(`OSM query error: ${osmData._error} (elements: ${osmData.elements || 0})`, 'error', 8000);
+            // record and bail out early
+            lastOsmElementsCount = osmData.elements?.length || 0;
+            return [];
+        }
+        lastOsmElementsCount = osmData.elements?.length || 0;
+    console.log('OSM Data structure:', {
+      elementsCount: lastOsmElementsCount,
+      elementTypes: [...new Set(osmData.elements?.map(el => el.type) || [])]
+    });
+        // If the server returned an extremely large number of elements, skip processing to avoid UI freeze
+        const MAX_OSM_ELEMENTS_PROCESS = 20000;
+        if (lastOsmElementsCount > MAX_OSM_ELEMENTS_PROCESS) {
+            console.warn('OSM payload too large, skipping processing:', lastOsmElementsCount);
+            setStatus('OSM payload too large — zoom in to request a smaller area', 'error', 8000);
+            return [];
+        }
         
         const allElements = extractElements(osmData);
         console.log('Filtered elements by tags:', allElements.length);
@@ -1611,7 +1730,6 @@ async function loadOsmFeaturesAt(lat, lon, radius = 500) {
   }
 }
 
-let iconMarkers = [];
 
 function addIconMarker(lat, lon, imageUrl, elevation) {
   // Use the same coordinate system as your globe (radius = 1)
@@ -1631,18 +1749,24 @@ function addIconMarker(lat, lon, imageUrl, elevation) {
       const material = new THREE.SpriteMaterial({ 
         map: texture, 
         transparent: true,
+        // enable depth testing so icons are occluded by nearer globe geometry
         depthTest: true,
+        // avoid writing to depth buffer so icons don't block other objects
         depthWrite: false
       });
       const sprite = new THREE.Sprite(material);
 
-      // Much smaller scale - adjust based on your needs
-      const scale = 0.05; // Experiment with this value
+      // Larger scale to ensure visibility on globe; tweak as needed
+      const scale = 0.08; // Experiment with this value
       sprite.scale.set(scale, scale, 1);
+      // store base scale so updateIconMarkers can adjust consistently
+      sprite.userData.baseScale = scale;
+      // Avoid frustum culling for small sprites (ensures they are always considered)
+      sprite.frustumCulled = false;
       sprite.position.copy(position);
       
       // Ensure icons render above other geometry
-      sprite.renderOrder = 1;
+      sprite.renderOrder = 9999;
       
       scene.add(sprite);
       iconMarkers.push(sprite);
@@ -1664,6 +1788,7 @@ function createFallbackMarker(position) {
   const marker = new THREE.Mesh(geometry, material);
   marker.position.copy(position);
   scene.add(marker);
+  marker.userData.baseScale = 0.04;
   iconMarkers.push(marker);
 }
 
