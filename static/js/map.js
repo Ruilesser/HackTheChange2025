@@ -961,7 +961,7 @@ async function processOsmJson(jsonString) {
 }
 
 // -----------------------------------------------------------
-// ICON_MAP (kept identical as Python)
+// ICON_MAP
 // -----------------------------------------------------------
 const ICON_MAP = {
     "amenity": { 
