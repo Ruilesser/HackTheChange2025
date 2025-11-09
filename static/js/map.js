@@ -35,8 +35,10 @@ debugOverlay.innerHTML = '';
 container.appendChild(debugOverlay);
 
 // Observer culling toggle (controls both client-side culling and whether
-// we send an observer_lat/observer_lon to server endpoints). Default: enabled.
-let observerCullingEnabled = true;
+// we send an observer_lat/observer_lon to server endpoints). Default: disabled.
+// Set false so features are rendered by default (no client/server culling)
+// unless the user explicitly enables it.
+let observerCullingEnabled = false;
 const observerCullingToggleEl = document.getElementById('toggle-observer-culling');
 if (observerCullingToggleEl) {
   try {
@@ -50,6 +52,10 @@ if (observerCullingToggleEl) {
 
 // Enable verbose logging for country outline streaming when debugging
 const DEBUG_COUNTRY_STREAM = true;
+
+// Toggle polygon simplification. Set false to disable simplifying polygons
+// client-side and request full-precision outlines from the server.
+const POLYGON_SIMPLIFICATION_ENABLED = false;
 
 // OSM / elevation controls
 let lastOsmElementsCount = 0; // number of elements in last OSM payload
@@ -757,6 +763,8 @@ function renderPolygon(rings, color = 0x00aa00) {
 
 // simple coordinate reducer (uniform sampling). Keeps first and last points.
 function simplifyCoords(coords, maxPoints) {
+  // If simplification has been disabled globally, return full coordinates.
+  if (!POLYGON_SIMPLIFICATION_ENABLED) return coords;
   if (!coords || coords.length <= maxPoints) return coords;
   const n = coords.length;
   const step = Math.ceil(n / maxPoints);
@@ -1169,6 +1177,10 @@ function cameraDistanceToRadius(distance) {
 // larger radius -> larger simplify (coarser). Returned value is a heurisitc
 // the server expects a 'simplify' number where larger means more simplification.
 function computeSimplifyForRadius(radiusMeters) {
+  // When polygon simplification is disabled, request zero simplification
+  // from the server (i.e. highest detail) and don't perform client-side
+  // reduction of coordinates.
+  if (!POLYGON_SIMPLIFICATION_ENABLED) return 0.0;
   const minR = 200, maxR = 10000;
   const t = Math.min(1, Math.max(0, (radiusMeters - minR) / (maxR - minR)));
   // map t in [0,1] -> simplify in [0.05 (detailed), 4.0 (very coarse)]
