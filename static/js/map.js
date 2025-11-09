@@ -526,12 +526,13 @@ function simplifyCoords(coords, maxPoints) {
 }
 
 async function fetchOverpass(lat, lon, radiusMeters) {
-  setStatus('Preparing OSM request — computing radius and method...', 'loading', null);
+  setStatus('Preparing OSM request — computing radius and method...', 'loading', 8000);
   // use streaming endpoint for larger radii to avoid large single responses
   const useStream = radiusMeters > 3000;
   try {
     if (useStream) {
-      await fetchOverpassStream(lat, lon, radiusMeters);
+      // stream with a generous timeout; abort if server is unresponsive
+      await fetchOverpassStream(lat, lon, radiusMeters, 25000);
     } else {
       const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
       // attach observer center so server can cull far-side features
@@ -543,7 +544,9 @@ async function fetchOverpass(lat, lon, radiusMeters) {
           qs.set('observer_lon', String(centerLatLon.lon));
         }
       } catch (e) {}
-      const res = await fetch(`/api/overpass?${qs.toString()}`);
+      setStatus('Requesting Overpass (synchronous) — waiting for server...', 'loading', 15000);
+      // abort if server doesn't respond in time
+      const res = await abortableFetch(`/api/overpass?${qs.toString()}`, { method: 'GET' }, 25000);
       if (!res.ok) {
         const txt = await res.text();
         throw new Error('Overpass API request failed: ' + txt);
@@ -593,7 +596,7 @@ async function fetchOverpass(lat, lon, radiusMeters) {
   }
 }
 
-async function fetchOverpassStream(lat, lon, radiusMeters) {
+async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
   clearFeatures();
   const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
   // attach observer center so server can cull far-side features
@@ -605,7 +608,18 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
       qs.set('observer_lon', String(centerLatLon.lon));
     }
   } catch (e) {}
-  const res = await fetch(`/api/overpass_stream?${qs.toString()}`);
+  let res;
+  try {
+    setStatus('Requesting Overpass stream — waiting for server...', 'loading', null);
+    res = await abortableFetch(`/api/overpass_stream?${qs.toString()}`, { method: 'GET' }, timeoutMs);
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      setStatus('Overpass stream timed out (server did not respond)', 'error', 8000);
+      return;
+    }
+    setStatus('Overpass stream request failed', 'error', 8000);
+    throw err;
+  }
   if (!res.ok) {
     const txt = await res.text();
     setStatus('Overpass stream request failed (server error)', 'error', 8000);
@@ -1024,6 +1038,20 @@ async function processElement(element, iconMap) {
         icon
     };
 }
+        // Abortable fetch helper with timeout (ms)
+        async function abortableFetch(input, init = {}, timeoutMs = 20000) {
+          const controller = new AbortController();
+          const signal = controller.signal;
+          const id = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const res = await fetch(input, Object.assign({}, init, { signal }));
+            clearTimeout(id);
+            return res;
+          } catch (err) {
+            clearTimeout(id);
+            throw err;
+          }
+        }
 
 // Test function to verify icons are working
 function testIconPlacement() {
