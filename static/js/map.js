@@ -19,6 +19,56 @@ fpsCounter.style.pointerEvents = 'none';
 fpsCounter.innerHTML = '';
 container.appendChild(fpsCounter);
 
+// debug overlay (shows sub-satellite, simplify, cooldown)
+const debugOverlay = document.createElement('div');
+debugOverlay.id = 'debug-overlay';
+debugOverlay.style.position = 'absolute';
+debugOverlay.style.left = '8px';
+debugOverlay.style.bottom = '8px';
+debugOverlay.style.padding = '6px 8px';
+debugOverlay.style.background = 'rgba(0,0,0,0.6)';
+debugOverlay.style.color = '#9fc';
+debugOverlay.style.font = '12px monospace';
+debugOverlay.style.zIndex = 9999;
+debugOverlay.style.pointerEvents = 'none';
+debugOverlay.innerHTML = '';
+container.appendChild(debugOverlay);
+
+// debug overlay updater (throttled)
+let lastDebugUpdate = 0;
+const DEBUG_UPDATE_MS = 500;
+function updateDebugOverlay() {
+  try {
+    const sub = getSubSatelliteLatLon() || { lat: null, lon: null };
+    let latStr = '-';
+    let lonStr = '-';
+    if (sub && typeof sub.lat === 'number') latStr = sub.lat.toFixed(4);
+    if (sub && typeof sub.lon === 'number') lonStr = sub.lon.toFixed(4);
+    // compute radius/simplify for display
+    let targetVec = null;
+    if (sub && sub.lat !== null && sub.lon !== null) targetVec = latLonToVector3(sub.lat, sub.lon, modelScaledRadius || RADIUS);
+    else targetVec = controls.target.clone();
+    const dist = camera.position.distanceTo(targetVec);
+    const radius = cameraDistanceToRadius(dist);
+    const simplify = computeSimplifyForRadius(radius);
+    const cooldownRem = Math.max(0, (overpassCooldownUntil || 0) - Date.now());
+    const pendingCount = countryBordersPending ? countryBordersPending.children.length : 0;
+    const bordersCount = countryBorders ? countryBorders.children.length : 0;
+    debugOverlay.innerHTML =
+      `<div style="line-height:1.2">
+         <strong>sub</strong>: ${latStr}, ${lonStr}<br>
+         <strong>radius</strong>: ${radius} m<br>
+         <strong>simplify</strong>: ${simplify.toFixed(3)}<br>
+         <strong>cooldown</strong>: ${Math.ceil(cooldownRem/1000)}s<br>
+         <strong>inFlight</strong>: ${inFlightOverpassRequests}<br>
+         <strong>pendingBorders</strong>: ${pendingCount}<br>
+         <strong>currentBorders</strong>: ${bordersCount}
+       </div>`;
+  } catch (e) {
+    // don't let overlay errors break render loop
+  }
+}
+
 // frame timing history (ms)
 const FRAME_HISTORY = 60;
 const frameTimes = [];
@@ -103,7 +153,10 @@ function latLonToVector3(lat, lon, radius = RADIUS) {
 // containers for OSM features
 const featurePoints = new THREE.Group();
 const featureLines = new THREE.Group();
-const countryBorders = new THREE.Group();
+// current rendered country borders group (swapped on each successful stream)
+let countryBorders = new THREE.Group();
+// pending group used while streaming; created per-stream
+let countryBordersPending = null;
 scene.add(featurePoints);
 scene.add(featureLines);
 scene.add(countryBorders);
@@ -192,7 +245,10 @@ function clearFeatures() {
 function clearAllFeatures() {
   featurePoints.clear();
   featureLines.clear();
-  countryBorders.clear();
+  // dispose and reset country borders as this is an explicit full-clear
+  try { disposeCountryGroup(countryBorders); } catch (e) { countryBorders.clear(); }
+  countryBorders = new THREE.Group();
+  scene.add(countryBorders);
   // remove sprite labels from scene
   for (const s of spriteLabels) {
     try { scene.remove(s); } catch (e) { /* ignore */ }
@@ -201,6 +257,46 @@ function clearAllFeatures() {
   }
   spriteLabels.length = 0;
   spriteLabelIndex.clear();
+}
+
+// Dispose geometries/materials/textures in a country borders group
+function disposeCountryGroup(group) {
+  if (!group) return;
+  try {
+    for (const child of group.children) {
+      try {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+          if (Array.isArray(child.material)) {
+            for (const m of child.material) {
+              if (m.map) m.map.dispose();
+              m.dispose && m.dispose();
+            }
+          } else {
+            if (child.material.map) child.material.map.dispose();
+            child.material.dispose && child.material.dispose();
+          }
+        }
+      } catch (e) { /* ignore per-child errors */ }
+    }
+    // remove children
+    group.clear();
+    try { scene.remove(group); } catch (e) {}
+  } catch (e) { /* ignore */ }
+}
+
+// Swap the active country borders with a new group (dispose old group)
+function swapCountryBorders(newGroup) {
+  if (!newGroup) return;
+  try {
+    // remove old
+    try { disposeCountryGroup(countryBorders); } catch (e) { /* ignore */ }
+    countryBorders = newGroup;
+    scene.add(countryBorders);
+    countryBordersPending = null;
+  } catch (e) {
+    console.warn('swapCountryBorders failed', e);
+  }
 }
 
 function renderPoint(lat, lon, color = 0xff3333, size = 0.02) {
@@ -232,7 +328,7 @@ function renderLine(coords, color = 0x00ff00, width = 1) {
   featureLines.add(line);
 }
 
-function renderCountryLine(coords, color = 0xffffff, width = 1) {
+function renderCountryLine(coords, color = 0xffffff, width = 1, targetGroup = countryBorders) {
   const radius = (modelScaledRadius || RADIUS) + 0.006;
   const sampled = simplifyCoords(coords, 800);
   const points = sampled.map(([lon, lat]) => latLonToVector3(lat, lon, radius));
@@ -246,7 +342,13 @@ function renderCountryLine(coords, color = 0xffffff, width = 1) {
   geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const mat = new THREE.LineBasicMaterial({ color, linewidth: width });
   const line = new THREE.Line(geom, mat);
-  countryBorders.add(line);
+  // add to provided group (pending or current)
+  try {
+    (targetGroup || countryBorders).add(line);
+  } catch (e) {
+    // fallback to main group
+    countryBorders.add(line);
+  }
 }
 
 async function fetchCountries(simplify = 0.2) {
@@ -275,8 +377,17 @@ async function fetchCountries(simplify = 0.2) {
 
 // New: stream country outlines (NDJSON) and render incrementally.
 async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null, simplify=0.1 } = {}) {
-  // when fetching countries we want to clear existing country outlines and labels
-  clearAllFeatures();
+  // when fetching countries we want to clear only OSM feature layers (points/lines)
+  // but keep current country outlines until the new stream completes to avoid
+  // an abrupt visual clear. We'll stream into `countryBordersPending` and
+  // swap when the stream finishes successfully.
+  clearFeatures();
+  if (countryBordersPending) {
+    // dispose any leftover pending group
+    disposeCountryGroup(countryBordersPending);
+    countryBordersPending = null;
+  }
+  countryBordersPending = new THREE.Group();
   // build query string
   const params = new URLSearchParams();
   params.set('simplify', String(simplify));
@@ -357,11 +468,11 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
         if (!frustum.containsPoint(worldPos)) continue;
       }
       if (geom.type === 'LineString') {
-        renderCountryLine(geom.coordinates, 0xffffff, 1);
+        renderCountryLine(geom.coordinates, 0xffffff, 1, countryBordersPending);
         addedCountryGeoms++;
         if (addedCountryGeoms % 40 === 0) setStatus(`Loading country outlines… ${addedCountryGeoms} segments rendered`, 'loading', null);
       } else if (geom.type === 'MultiLineString') {
-        for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+        for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1, countryBordersPending);
       }
       // collect label info and add label (country name)
       if (obj.properties && obj.properties.name) {
@@ -417,6 +528,17 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
     } catch (e) {
       // ignore
     }
+  }
+  // swap pending borders into view (dispose old borders)
+  try {
+    if (countryBordersPending && countryBordersPending.children.length > 0) {
+      swapCountryBorders(countryBordersPending);
+    } else {
+      // nothing streamed; dispose pending
+      if (countryBordersPending) { disposeCountryGroup(countryBordersPending); countryBordersPending = null; }
+    }
+  } catch (e) {
+    console.warn('Failed to swap country borders', e);
   }
   // labels are created during streaming; they'll be updated each frame
   setStatus(`Country outlines: ${addedCountryGeoms} segments loaded`, 'info', 4000);
@@ -936,13 +1058,36 @@ function getSubSatelliteLatLon() {
 // map camera distance to Overpass search radius (meters)
 function cameraDistanceToRadius(distance) {
   // distance roughly scales with model radius (modelScaledRadius==1)
-  // map distance in [1.5, 10] -> radius in meters [200, 20000]
+  // map distance in [1.5, 10] -> radius in meters [200, 10000]
   const minD = 1.5, maxD = 10;
-  const minR = 200, maxR = 20000;
+  const minR = 200, maxR = 10000;
   const t = Math.min(1, Math.max(0, (distance - minD) / (maxD - minD)));
   // invert so smaller distance => smaller radius
   const v = 1 - t;
   return Math.round(minR + v * (maxR - minR));
+}
+
+// compute an appropriate simplification level for country outlines
+// larger radius -> larger simplify (coarser). Returned value is a heurisitc
+// the server expects a 'simplify' number where larger means more simplification.
+function computeSimplifyForRadius(radiusMeters) {
+  const minR = 200, maxR = 10000;
+  const t = Math.min(1, Math.max(0, (radiusMeters - minR) / (maxR - minR)));
+  // map t in [0,1] -> simplify in [0.05 (detailed), 4.0 (very coarse)]
+  const simplify = 0.05 + t * (4.0 - 0.05);
+  return simplify;
+}
+
+// track last country-outline request to avoid redundant streaming requests
+let lastCountriesFetch = { lat: null, lon: null, radius: null, simplify: null };
+
+function shouldFetchCountries(newLat, newLon, newRadius, newSimplify) {
+  if (lastCountriesFetch.lat === null) return true;
+  const dLat = Math.abs((lastCountriesFetch.lat || 0) - newLat);
+  const dLon = Math.abs((lastCountriesFetch.lon || 0) - newLon);
+  const metersMoved = Math.sqrt((dLat * 111320) ** 2 + (dLon * 111320) ** 2);
+  const simplifyChanged = lastCountriesFetch.simplify === null ? true : (Math.abs((lastCountriesFetch.simplify || 0) - newSimplify) / (lastCountriesFetch.simplify || 1) > 0.35);
+  return metersMoved > 2000 || simplifyChanged;
 }
 
 // center camera and controls target on lat/lon; factor controls camera distance multiplier
@@ -993,6 +1138,19 @@ function scheduleFetchForControls() {
       // use scheduled/throttled fetch to avoid spamming Overpass
       scheduleOverpassFetch(lat, lon, radius);
     }
+
+    // Adaptive country-outline LOD: request a simplified country stream for
+    // the current sub-satellite area when it changed meaningfully.
+    try {
+      const simplify = computeSimplifyForRadius(radius);
+      if (shouldFetchCountries(lat, lon, radius, simplify)) {
+        lastCountriesFetch = { lat, lon, radius, simplify };
+        // fetch incrementally and render country outlines for visible area
+        fetchCountriesStream({ lat, lon, radius, simplify }).catch(err => console.warn('countries stream error', err));
+      }
+    } catch (e) {
+      // ignore country fetch errors here
+    }
   }, 600);
 }
 
@@ -1040,13 +1198,34 @@ function animate() {
   if (min === Infinity) min = 0;
   // update UI
   fpsCounter.innerHTML = `FPS: ${smoothedFps.toFixed(1)} &nbsp;|&nbsp; frame: ${dt.toFixed(1)} ms<br>avg: ${avg.toFixed(1)} ms (min ${min.toFixed(1)} / max ${max.toFixed(1)})`;
+  // throttled debug overlay update
+  const nowMs = Date.now();
+  if (nowMs - lastDebugUpdate > DEBUG_UPDATE_MS) {
+    lastDebugUpdate = nowMs;
+    updateDebugOverlay();
+  }
 }
 
 animate();
 
-// fetch and render country borders via streaming (covers full globe initially)
-// bbox format: minlat,minlon,maxlat,maxlon
-fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 0.2 });
+// fetch and render country borders via streaming — request only the visible
+// hemisphere/area at an appropriate simplification level so we don't pull
+// the entire globe at high detail on startup.
+// We'll request outlines centered on the current sub-satellite point with
+// a simplify value computed from camera radius; scheduleFetchForControls
+// will fetch updates as the user moves/zooms.
+try {
+  const sub = getSubSatelliteLatLon() || { lat: 0, lon: 0 };
+  const dist = camera.position.distanceTo(controls.target || new THREE.Vector3());
+  const radius = cameraDistanceToRadius(dist);
+  const simplify = computeSimplifyForRadius(radius);
+  // set lastCountriesFetch so schedule logic can skip redundant requests
+  lastCountriesFetch = { lat: sub.lat, lon: sub.lon, radius, simplify };
+  fetchCountriesStream({ lat: sub.lat, lon: sub.lon, radius, simplify });
+} catch (e) {
+  // fallback to coarse globe request if something goes wrong
+  fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 1.5 });
+}
 
 ///* TEST ICONS WORK, uncomment this if you want to see test values
 setTimeout(() => {
@@ -1273,23 +1452,20 @@ async function processElement(element, iconMap) {
         return null;
     }
 }
-
-// -----------------------------------------------------------
-// Abortable fetch helper with timeout (ms)
-// -----------------------------------------------------------
-async function abortableFetch(input, init = {}, timeoutMs = 20000) {
-  const controller = new AbortController();
-  const signal = controller.signal;
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(input, Object.assign({}, init, { signal }));
-    clearTimeout(id);
-    return res;
-  } catch (err) {
-    clearTimeout(id);
-    throw err;
-  }
-}
+        // Abortable fetch helper with timeout (ms)
+        async function abortableFetch(input, init = {}, timeoutMs = 20000) {
+          const controller = new AbortController();
+          const signal = controller.signal;
+          const id = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const res = await fetch(input, Object.assign({}, init, { signal }));
+            clearTimeout(id);
+            return res;
+          } catch (err) {
+            clearTimeout(id);
+            throw err;
+          }
+        }
 
 // Test function to verify icons are working
 function testIconPlacement() {
