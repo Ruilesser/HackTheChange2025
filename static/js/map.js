@@ -653,14 +653,6 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
   }
 }
 
-// UI: load example OSM reconstruction data (London 5 km)
-document.getElementById('load-osm').addEventListener('click', () => {
-  // center near London by default and fetch
-  const lat = 51.5074, lon = -0.1278;
-  centerOnLatLon(lat, lon, 3.5);
-  fetchOverpass(lat, lon, 5000);
-});
-
 // Geolocation: center on user's current position
 document.getElementById('locate-me').addEventListener('click', () => {
   const status = document.getElementById('status');
