@@ -571,8 +571,118 @@ def api_countries():
 
     data = get_country_boundaries(simplify_tol=simplify)
     if data is None:
-        return jsonify({'error': 'countries data not available (could not download or parse)'}), 500
+        # fallback to empty collection (shouldn't happen with updated get_country_boundaries)
+        return jsonify({'type': 'FeatureCollection', 'features': []})
     return jsonify(data)
+
+
+@app.route('/api/countries_stream')
+def api_countries_stream():
+    """Stream country boundaries as NDJSON, filtered by bbox or lat/lon+radius.
+
+    Query params (one of):
+      - bbox=minlat,minlon,maxlat,maxlon
+      - lat, lon, radius (meters)
+      - simplify (float degrees, optional)
+
+    Returns newline-delimited GeoJSON Feature objects (LineString) with properties including 'name'.
+    """
+    bbox = request.args.get('bbox')
+    lat = request.args.get('lat', type=float)
+    lon = request.args.get('lon', type=float)
+    radius = request.args.get('radius', type=float)
+
+    try:
+        simplify = float(request.args.get('simplify', 0.1))
+    except Exception:
+        simplify = 0.1
+
+    if not bbox and (lat is None or lon is None or radius is None):
+        return jsonify({"error": "Provide bbox or lat+lon+radius"}), 400
+
+    if not bbox:
+        lat_delta = radius / 111320.0
+        lon_delta = radius / (111320.0 * max(0.00001, abs(math.cos(math.radians(lat)))) )
+        minlat = lat - lat_delta
+        maxlat = lat + lat_delta
+        minlon = lon - lon_delta
+        maxlon = lon + lon_delta
+    else:
+        try:
+            parts = [float(p) for p in bbox.split(',')]
+            if len(parts) != 4:
+                raise ValueError()
+            minlat, minlon, maxlat, maxlon = parts
+        except Exception:
+            return jsonify({"error": "Invalid bbox format. Use minlat,minlon,maxlat,maxlon"}), 400
+
+    # Load country boundaries (cached)
+    countries = get_country_boundaries(simplify_tol=simplify)
+    if not countries or 'features' not in countries:
+        # return empty stream
+        def empty_gen():
+            yield json.dumps({"_meta": {"status": "done", "features": 0}}) + "\n"
+        return Response(empty_gen(), mimetype='application/x-ndjson')
+
+    # Try shapely to robustly test intersection. If not available, fallback to bbox-coordinate check.
+    try:
+        from shapely.geometry import shape, box
+        shapely_ok = True
+    except Exception:
+        shapely_ok = False
+
+    target_box = None
+    if shapely_ok:
+        target_box = box(minlon, minlat, maxlon, maxlat)
+
+    def gen():
+        count = 0
+        for feat in countries.get('features', []):
+            geom = feat.get('geometry')
+            props = feat.get('properties', {}) or {}
+            if not geom:
+                continue
+            try:
+                if shapely_ok:
+                    gshape = shape(geom)
+                    if not gshape.intersects(target_box):
+                        continue
+                    # If intersects, yield the feature (keep properties)
+                    out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': props }
+                    yield json.dumps(out) + "\n"
+                    count += 1
+                else:
+                    # fallback: simple coordinate check - if any coordinate falls inside bbox, include
+                    included = False
+                    gtype = geom.get('type')
+                    coords = geom.get('coordinates')
+                    if not coords:
+                        continue
+                    def any_in_ring(ring):
+                        for lon, lat in ring:
+                            if minlat <= lat <= maxlat and minlon <= lon <= maxlon:
+                                return True
+                        return False
+                    if gtype == 'LineString':
+                        if any_in_ring(coords):
+                            included = True
+                    elif gtype == 'MultiLineString':
+                        for part in coords:
+                            if any_in_ring(part):
+                                included = True
+                                break
+                    if not included:
+                        continue
+                    out = { 'type': 'Feature', 'geometry': json.loads(json.dumps(geom)), 'properties': props }
+                    yield json.dumps(out) + "\n"
+                    count += 1
+            except Exception as e:
+                app.logger.debug('Skipping country feature due to error: %s', e)
+                continue
+        # final meta
+        yield json.dumps({"_meta": {"status": "done", "features": count}}) + "\n"
+
+    return Response(gen(), mimetype='application/x-ndjson')
 
 
 @app.route('/favicon.ico')

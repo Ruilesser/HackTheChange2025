@@ -1,7 +1,6 @@
 // map.js - module that builds a Three.js globe and supports markers
 import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
 import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
-import { GLTFLoader } from 'https://unpkg.com/three@0.158.0/examples/jsm/loaders/GLTFLoader.js';
 
 const container = document.getElementById('map-container');
 
@@ -27,45 +26,16 @@ const dir = new THREE.DirectionalLight(0xffffff, 0.6);
 dir.position.set(5, 3, 5);
 scene.add(dir);
 
-// globe/model
-const RADIUS = 1; // we will normalize the GLB to this radius
+// globe (procedural sphere)
+const RADIUS = 1;
 let globe = null;
-let modelScaledRadius = RADIUS; // radius after scaling model to RADIUS
-
-const loader = new GLTFLoader();
-const modelPath = '/static/assets/models/Earth_1_12756.glb';
-
-loader.load(
-  modelPath,
-  (gltf) => {
-    const obj = gltf.scene || gltf.scenes[0];
-    // compute bounding sphere of the imported model
-    const bbox = new THREE.Box3().setFromObject(obj);
-    const bs = bbox.getBoundingSphere(new THREE.Sphere());
-    const currentRadius = bs.radius || 1;
-
-    // compute scale factor to normalize to our RADIUS
-    const s = RADIUS / currentRadius;
-    obj.scale.setScalar(s);
-
-    // center the model to origin (optional, helps if model isn't centered)
-    const center = bs.center.clone().multiplyScalar(-s);
-    obj.position.add(center);
-
-    globe = obj;
-    modelScaledRadius = RADIUS; // after scaling, radius is RADIUS
-    scene.add(globe);
-  },
-  undefined,
-  (err) => {
-    console.error('Failed to load GLB model', err);
-    // fallback: simple sphere so page still works
-    const sphereGeo = new THREE.SphereGeometry(RADIUS, 64, 64);
-    const mat = new THREE.MeshStandardMaterial({ color: 0x2266aa, roughness: 1 });
-    globe = new THREE.Mesh(sphereGeo, mat);
-    scene.add(globe);
-  }
-);
+let modelScaledRadius = RADIUS;
+{
+  const sphereGeo = new THREE.SphereGeometry(RADIUS, 64, 64);
+  const mat = new THREE.MeshStandardMaterial({ color: 0x2266aa, roughness: 1 });
+  globe = new THREE.Mesh(sphereGeo, mat);
+  scene.add(globe);
+}
 
 // helper: convert lat/lon to 3D on sphere
 function latLonToVector3(lat, lon, radius = RADIUS) {
@@ -161,6 +131,76 @@ async function fetchCountries(simplify = 0.2) {
   } catch (e) {
     console.error('Error fetching countries', e);
   }
+}
+
+// New: stream country outlines (NDJSON) and render incrementally.
+async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null, simplify=0.1 } = {}) {
+  clearFeatures();
+  // build query string
+  const params = new URLSearchParams();
+  params.set('simplify', String(simplify));
+  if (bbox) params.set('bbox', bbox);
+  else if (lat !== null && lon !== null && radius !== null) {
+    params.set('lat', String(lat));
+    params.set('lon', String(lon));
+    params.set('radius', String(radius));
+  }
+
+  const res = await fetch(`/api/countries_stream?${params.toString()}`);
+  if (!res.ok) {
+    const txt = await res.text();
+    console.warn('Countries stream failed', txt);
+    return;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  // placeholder for labels or additional metadata
+  const pendingLabels = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch (e) {
+        console.warn('Failed to parse NDJSON line', e, line);
+        continue;
+      }
+      if (obj._meta) continue;
+      // expect feature with geometry LineString/MultiLineString
+      const geom = obj.geometry;
+      if (!geom) continue;
+      if (geom.type === 'LineString') {
+        renderCountryLine(geom.coordinates, 0xffffff, 1);
+      } else if (geom.type === 'MultiLineString') {
+        for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+      }
+      // collect label info for later (country name)
+      if (obj.properties && obj.properties.name) {
+        pendingLabels.push({ name: obj.properties.name, geometry: geom });
+      }
+    }
+  }
+  // final buffer
+  if (buf.trim()) {
+    try {
+      const obj = JSON.parse(buf.trim());
+      if (obj && obj.geometry) {
+        const geom = obj.geometry;
+        if (geom.type === 'LineString') renderCountryLine(geom.coordinates, 0xffffff, 1);
+        else if (geom.type === 'MultiLineString') for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+  // TODO: convert pendingLabels into screen labels (future)
 }
 
 function renderPolygon(rings, color = 0x00aa00) {
@@ -398,5 +438,6 @@ function animate() {
 
 animate();
 
-// fetch and render country borders once (simplified)
-fetchCountries(0.2);
+// fetch and render country borders via streaming (covers full globe initially)
+// bbox format: minlat,minlon,maxlat,maxlon
+fetchCountriesStream({ bbox: '-90,-180,90,180', simplify: 0.2 });
