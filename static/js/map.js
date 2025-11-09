@@ -25,10 +25,34 @@ const frameTimes = [];
 let lastFrameTime = performance.now();
 let smoothedFps = 0;
 
+// status element helper (shows short user-facing messages)
+const statusEl = document.getElementById('status');
+function setStatus(msg, level = 'info', timeout = 6000) {
+  try {
+    if (!statusEl) return;
+    statusEl.textContent = msg || '';
+    if (level === 'error') {
+      statusEl.style.color = '#ff8888';
+    } else if (level === 'loading') {
+      statusEl.style.color = '#ffd166';
+    } else {
+      statusEl.style.color = '#ddd';
+    }
+    if (statusEl._clearTimer) { clearTimeout(statusEl._clearTimer); statusEl._clearTimer = null; }
+    if (timeout && msg) {
+      statusEl._clearTimer = setTimeout(() => { try { statusEl.textContent = ''; } catch (e) {} }, timeout);
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+function clearStatus() { if (statusEl) { statusEl.textContent = ''; if (statusEl._clearTimer) { clearTimeout(statusEl._clearTimer); statusEl._clearTimer = null; } } }
+
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b1020);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// enable depth buffer so scene geometry is depth-tested and occludes correctly
+const renderer = new THREE.WebGLRenderer({ antialias: true, depth: true });
 // clamp pixel ratio to avoid huge canvases on hi-dpi devices (Surface Pro etc.)
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 // ensure canvas is displayed as block so it sizes predictably across browsers
@@ -207,13 +231,17 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
   if (!res.ok) {
     const txt = await res.text();
     console.warn('Countries stream failed', txt);
+    setStatus('Failed to load country outlines from server', 'error', 8000);
     return;
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
+  let featureCount = 0;
+  setStatus('Streaming OSM features — receiving tiles...', 'loading', null);
   // placeholder for labels or additional metadata
   const pendingLabels = [];
+  let addedCountryGeoms = 0;
   // prepare camera frustum and direction once for this streaming session
   const camDir = new THREE.Vector3();
   camera.getWorldDirection(camDir);
@@ -259,6 +287,8 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       }
       if (geom.type === 'LineString') {
         renderCountryLine(geom.coordinates, 0xffffff, 1);
+        addedCountryGeoms++;
+        if (addedCountryGeoms % 40 === 0) setStatus(`Loading country outlines… ${addedCountryGeoms} segments rendered`, 'loading', null);
       } else if (geom.type === 'MultiLineString') {
         for (const part of geom.coordinates) renderCountryLine(part, 0xffffff, 1);
       }
@@ -318,6 +348,7 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
     }
   }
   // labels are created during streaming; they'll be updated each frame
+  setStatus(`Country outlines: ${addedCountryGeoms} segments loaded`, 'info', 4000);
 }
 
 // compute a representative lat/lon for a LineString or MultiLineString geometry
@@ -368,7 +399,9 @@ function createLabelSprite(text) {
   ctx.fillText(text, padding, canvas.height / 2);
   const texture = new THREE.CanvasTexture(canvas);
   texture.minFilter = THREE.LinearFilter;
-  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+  // enable depthTest so labels can be occluded by nearer geometry (the globe)
+  // but avoid writing to the depth buffer so labels don't block other objects
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true, depthWrite: false });
   const sprite = new THREE.Sprite(mat);
   // store pixel size for collision heuristics
   sprite.userData.screenSize = { w: canvas.width, h: canvas.height };
@@ -487,8 +520,7 @@ function simplifyCoords(coords, maxPoints) {
 }
 
 async function fetchOverpass(lat, lon, radiusMeters) {
-  const status = document.getElementById('status');
-  status.textContent = 'Loading...';
+  setStatus('Preparing OSM request — computing radius and method...', 'loading', null);
   // use streaming endpoint for larger radii to avoid large single responses
   const useStream = radiusMeters > 3000;
   try {
@@ -551,7 +583,7 @@ async function fetchOverpass(lat, lon, radiusMeters) {
     console.error('Failed to fetch/parse Overpass data', err);
     alert('Failed to load Overpass data: ' + err.message);
   } finally {
-    status.textContent = '';
+    clearStatus();
   }
 }
 
@@ -570,6 +602,7 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
   const res = await fetch(`/api/overpass_stream?${qs.toString()}`);
   if (!res.ok) {
     const txt = await res.text();
+    setStatus('Overpass stream request failed (server error)', 'error', 8000);
     throw new Error('Overpass stream failed: ' + txt);
   }
   const reader = res.body.getReader();
@@ -601,7 +634,10 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
         continue;
       }
       if (obj._meta) {
-        // progress or done marker
+        // progress or done marker - the server may emit summaries here
+        if (obj._meta && obj._meta.message) {
+          setStatus(obj._meta.message, 'loading', null);
+        }
         continue;
       }
       // treat as GeoJSON Feature
@@ -625,10 +661,17 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
       if (geom.type === 'Point') {
         const [lon, lat] = geom.coordinates;
         renderPoint(lat, lon, 0xff5533, 0.02);
+        featureCount++;
       } else if (geom.type === 'LineString') {
         renderLine(geom.coordinates, 0x00ff88);
+        featureCount++;
       } else if (geom.type === 'Polygon') {
         renderPolygon(geom.coordinates, 0x009988);
+        featureCount++;
+      }
+      // update status occasionally to show progress
+      if (featureCount > 0 && featureCount % 200 === 0) {
+        setStatus(`Streaming OSM features… ${featureCount} features received`, 'loading', null);
       }
     }
   }
@@ -651,16 +694,18 @@ async function fetchOverpassStream(lat, lon, radiusMeters) {
       console.warn('final NDJSON parse failed', e, buf);
     }
   }
+  setStatus(`Done — streamed ${featureCount} features`, 'info', 6000);
 }
 
 // Geolocation: center on user's current position
 document.getElementById('locate-me').addEventListener('click', () => {
-  const status = document.getElementById('status');
+  // show a friendly status while geolocation runs
+  setStatus('Requesting device location…', 'loading', 10000);
   if (!navigator.geolocation) {
+    setStatus('Geolocation not supported by your browser', 'error', 5000);
     alert('Geolocation not supported by your browser');
     return;
   }
-  status.textContent = 'Requesting location...';
   navigator.geolocation.getCurrentPosition((pos) => {
     const lat = pos.coords.latitude;
     const lon = pos.coords.longitude;
@@ -669,9 +714,10 @@ document.getElementById('locate-me').addEventListener('click', () => {
     const dist = camera.position.distanceTo(controls.target || new THREE.Vector3());
     const radius = cameraDistanceToRadius(dist);
     fetchOverpass(lat, lon, radius);
-    status.textContent = '';
+    clearStatus();
   }, (err) => {
-    status.textContent = '';
+    clearStatus();
+    setStatus('Failed to get device location', 'error', 6000);
     alert('Failed to get location: ' + (err && err.message));
   }, { enableHighAccuracy: true, maximumAge: 60000, timeout: 10000 });
 });
