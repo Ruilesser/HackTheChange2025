@@ -108,6 +108,11 @@ scene.add(featurePoints);
 scene.add(featureLines);
 scene.add(countryBorders);
 
+// Overpass rate-limit / cooldown handling
+let overpassCooldownUntil = 0; // ms timestamp until which we should not issue new Overpass requests
+const OVERPASS_COOLDOWN_DEFAULT_MS = 60 * 1000; // 60s cooldown on 429
+function inOverpassCooldown() { return Date.now() < (overpassCooldownUntil || 0); }
+
 // Sprite-based labels (Three.js) for performance and consistent scaling
 const spriteLabels = []; // array of sprites
 // index to deduplicate labels by name or centroid key -> sprite
@@ -218,10 +223,9 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
     params.set('radius', String(radius));
   }
 
-  // include observer (controls.target) so server can perform hemisphere/backface culling
+  // include observer (sub-satellite point computed from camera) so server can perform hemisphere/backface culling
   try {
-    const center = controls.target.clone();
-    const centerLatLon = vector3ToLatLon(center);
+    const centerLatLon = getSubSatelliteLatLon();
     if (centerLatLon && typeof centerLatLon.lat === 'number') {
       params.set('observer_lat', String(centerLatLon.lat));
       params.set('observer_lon', String(centerLatLon.lon));
@@ -535,10 +539,9 @@ async function fetchOverpass(lat, lon, radiusMeters) {
       await fetchOverpassStream(lat, lon, radiusMeters, 25000);
     } else {
       const qs = new URLSearchParams({ lat: String(lat), lon: String(lon), radius: String(radiusMeters) });
-      // attach observer center so server can cull far-side features
+      // attach observer center (sub-satellite point computed from camera) so server can cull far-side features
       try {
-        const center = controls.target.clone();
-        const centerLatLon = vector3ToLatLon(center);
+        const centerLatLon = getSubSatelliteLatLon();
         if (centerLatLon && typeof centerLatLon.lat === 'number') {
           qs.set('observer_lat', String(centerLatLon.lat));
           qs.set('observer_lon', String(centerLatLon.lon));
@@ -548,6 +551,12 @@ async function fetchOverpass(lat, lon, radiusMeters) {
       // abort if server doesn't respond in time
       const res = await abortableFetch(`/api/overpass?${qs.toString()}`, { method: 'GET' }, 25000);
       if (!res.ok) {
+        // handle rate-limit specially
+        if (res.status === 429) {
+          overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+          setStatus('Overpass rate limit reached — pausing requests for 60s', 'error', 8000);
+          return;
+        }
         const txt = await res.text();
         throw new Error('Overpass API request failed: ' + txt);
       }
@@ -652,6 +661,18 @@ async function fetchOverpassStream(lat, lon, radiusMeters, timeoutMs = 25000) {
       }
       if (obj._error) {
         console.warn('Overpass tile error', obj);
+        // If server reports Overpass rate limiting (429) for a tile, pause further Overpass queries
+        try {
+          const details = String(obj.details || '').toLowerCase();
+          if (details.includes('429') || details.includes('too many requests')) {
+            overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+            setStatus('Overpass rate limit reached (tile requests) — pausing for 60s', 'error', 8000);
+            try { await reader.cancel(); } catch (e) { /* ignore */ }
+            return; // stop processing the stream
+          }
+        } catch (e) {
+          // ignore parsing errors
+        }
         continue;
       }
       if (obj._meta) {
@@ -770,9 +791,41 @@ document.getElementById('locate-me').addEventListener('click', () => {
 // helpers: convert 3D vector to lat/lon
 function vector3ToLatLon(v) {
   const r = v.length() || 1;
-  const lat = 90 - Math.acos(v.y / r) * (180 / Math.PI);
-  const lon = Math.atan2(v.z, -v.x) * (180 / Math.PI) - 180;
+  // latitude from asin for numerical stability
+  const lat = Math.asin(v.y / r) * (180 / Math.PI);
+  // reconstruct longitude from x/z using the same convention as latLonToVector3
+  let lon = Math.atan2(v.z, -v.x) * (180 / Math.PI) - 180;
+  // normalize longitude to [-180, 180]
+  while (lon < -180) lon += 360;
+  while (lon > 180) lon -= 360;
   return { lat, lon };
+}
+
+// compute the sub-satellite point (latitude/longitude) from the current camera
+// by intersecting the camera ray with the globe. Falls back to controls.target
+// if there's no intersection (e.g. camera inside the globe).
+function getSubSatelliteLatLon() {
+  try {
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    const o = camera.position.clone();
+    const d = dir.clone().normalize();
+    const R = (modelScaledRadius || RADIUS);
+    const od = o.dot(d);
+    const oo = o.dot(o);
+    const disc = od * od - (oo - R * R);
+    if (disc < 0) {
+      // no intersection; fall back to controls.target
+      const center = controls.target.clone();
+      return vector3ToLatLon(center);
+    }
+    // smallest positive t
+    const t = -od - Math.sqrt(disc);
+    const point = o.add(d.multiplyScalar(t));
+    return vector3ToLatLon(point);
+  } catch (e) {
+    try { return vector3ToLatLon(controls.target.clone()); } catch (er) { return null; }
+  }
 }
 
 // map camera distance to Overpass search radius (meters)
@@ -814,9 +867,21 @@ function shouldFetch(newLat, newLon, newRadius) {
 function scheduleFetchForControls() {
   if (fetchScheduled) clearTimeout(fetchScheduled);
   fetchScheduled = setTimeout(() => {
-    const target = controls.target.clone();
-    const { lat, lon } = vector3ToLatLon(target);
-    const dist = camera.position.distanceTo(target);
+    if (inOverpassCooldown()) {
+      const remaining = Math.ceil((overpassCooldownUntil - Date.now()) / 1000);
+      setStatus(`Overpass rate limit active — waiting ${remaining}s before retrying`, 'error', 4000);
+      return;
+    }
+    const sub = getSubSatelliteLatLon();
+    const { lat, lon } = sub || { lat: null, lon: null };
+    // build a target vector for distance/radius calculation
+    let targetVec = null;
+    if (lat !== null && lon !== null) {
+      targetVec = latLonToVector3(lat, lon, modelScaledRadius || RADIUS);
+    } else {
+      targetVec = controls.target.clone();
+    }
+    const dist = camera.position.distanceTo(targetVec);
     const radius = cameraDistanceToRadius(dist);
     if (shouldFetch(lat, lon, radius)) {
       lastFetch = { lat, lon, radius };
@@ -1154,6 +1219,7 @@ function testIconPlacement() {
 // -----------------------------------------------------------
 async function getOsmJson(lat, lon, radius = 500) {
     // radius = 500 is the default, can be overwritten by passing a different value
+    if (inOverpassCooldown()) throw new Error('Overpass cooldown active');
     const overpassUrl = "https://overpass-api.de/api/interpreter";
     const query = `
         [out:json];
@@ -1167,16 +1233,35 @@ async function getOsmJson(lat, lon, radius = 500) {
         out skel qt;
     `;
 
-    const response = await fetch(overpassUrl, {
-        method: "POST", // Overpass API expects POST for queries
-        body: query
-    });
-
-    if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+    // Retry with small backoff on transient failures (including occasional 429)
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await fetch(overpassUrl, {
+          method: "POST",
+          body: query
+        });
+        if (!response.ok) {
+          if (response.status === 429) {
+            // respect server rate-limit
+            overpassCooldownUntil = Date.now() + OVERPASS_COOLDOWN_DEFAULT_MS;
+            setStatus('Overpass rate limit: delaying icon load for 60s', 'error', 8000);
+            throw new Error(`Overpass rate limited (429)`);
+          }
+          const txt = await response.text();
+          throw new Error(`HTTP error! status: ${response.status} - ${txt}`);
+        }
+        return await response.json();
+      } catch (err) {
+        console.warn(`Overpass attempt ${attempt} failed:`, err.message || err);
+        if (attempt < maxAttempts) {
+          const backoff = attempt === 1 ? 1500 : 4000;
+          await new Promise(r => setTimeout(r, backoff));
+          continue;
+        }
+        throw err;
+      }
     }
-
-    return await response.json();
 }
 
 
