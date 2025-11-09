@@ -541,13 +541,11 @@ async function fetchCountries(simplify = 0.2) {
       console.warn('fetchCountries: server returned no features');
       return;
     }
+    // Store received data for diagnostics and other consumers
+    try { lastCountryData = geo.features.slice(); } catch (e) { lastCountryData = []; }
 
-    // Replace previous country borders group so we render a fresh set all at once
-    try {
-      disposeCountryGroup(countryBorders);
-    } catch (e) { /* ignore */ }
-    countryBorders = new THREE.Group();
-    scene.add(countryBorders);
+    // Build a new group and render all features into it, then swap it in place
+    const newGroup = new THREE.Group();
 
     console.info(`fetchCountries: received ${geo.features.length} features`);
     // log sample of feature types for diagnostics
@@ -560,23 +558,59 @@ async function fetchCountries(simplify = 0.2) {
       console.debug('fetchCountries: sample feature types', types);
     } catch (e) {}
 
-    for (const f of geo.features) {
-      const g = f.geometry;
-      if (!g) continue;
+    // Counters for diagnostics
+    let counts = { LineString: 0, MultiLineString: 0, Polygon: 0, MultiPolygon: 0, GeometryCollection: 0, other: 0 };
+    function renderGeometry(g, targetGroup) {
+      if (!g || !g.type) return;
       try {
         if (g.type === 'LineString') {
-          renderCountryLine(g.coordinates, 0xffffff, 1, countryBorders);
+          renderCountryLine(g.coordinates, 0xffffff, 1, targetGroup);
+          counts.LineString++;
         } else if (g.type === 'MultiLineString') {
-          for (const part of g.coordinates) renderCountryLine(part, 0xffffff, 1, countryBorders);
+          for (const part of g.coordinates) renderCountryLine(part, 0xffffff, 1, targetGroup);
+          counts.MultiLineString++;
         } else if (g.type === 'Polygon') {
-          // fallback: render polygon exterior as a line
-          if (Array.isArray(g.coordinates) && g.coordinates.length > 0) renderCountryLine(g.coordinates[0], 0xffffff, 1, countryBorders);
+          // render exterior and optionally interior rings
+          if (Array.isArray(g.coordinates) && g.coordinates.length > 0) {
+            renderCountryLine(g.coordinates[0], 0xffffff, 1, targetGroup);
+            // render holes as subtler lines to aid debugging
+            for (let i = 1; i < g.coordinates.length; i++) renderCountryLine(g.coordinates[i], 0x666666, 1, targetGroup);
+          }
+          counts.Polygon++;
         } else if (g.type === 'MultiPolygon') {
-          for (const poly of g.coordinates) if (poly && poly[0]) renderCountryLine(poly[0], 0xffffff, 1, countryBorders);
+          for (const poly of g.coordinates) {
+            if (poly && poly[0]) renderCountryLine(poly[0], 0xffffff, 1, targetGroup);
+            for (let i = 1; poly && i < poly.length; i++) renderCountryLine(poly[i], 0x666666, 1, targetGroup);
+          }
+          counts.MultiPolygon++;
+        } else if (g.type === 'GeometryCollection' && Array.isArray(g.geometries)) {
+          counts.GeometryCollection++;
+          for (const sg of g.geometries) renderGeometry(sg, targetGroup);
+        } else {
+          counts.other++;
         }
       } catch (e) {
-        console.warn('fetchCountries: failed to render feature', e);
+        console.warn('fetchCountries.renderGeometry failed', e);
       }
+    }
+
+    for (const f of geo.features) {
+      if (!f || !f.geometry) continue;
+      renderGeometry(f.geometry, newGroup);
+    }
+
+    console.debug('fetchCountries: geometry counts', counts);
+
+    // Swap the new group into place (this disposes the previous one)
+    try {
+      swapCountryBorders(newGroup);
+    } catch (e) {
+      // Fallback: add it manually if swap fails
+      try {
+        disposeCountryGroup(countryBorders);
+      } catch (er) {}
+      countryBorders = newGroup;
+      scene.add(countryBorders);
     }
   } catch (e) {
     console.error('Error fetching countries', e);
@@ -790,12 +824,10 @@ async function fetchCountriesStream({ bbox=null, lat=null, lon=null, radius=null
       if (countryBordersPending) { disposeCountryGroup(countryBordersPending); countryBordersPending = null; }
       if (addedCountryGeoms === 0) {
         // Stream returned no segments — try the non-streaming endpoint as a fallback.
-        // To avoid spamming repeated fallbacks when user continues to interact,
-        // set a cooldown that prevents another country fetch for a short while.
+        // Request highest detail (simplify=0.0).
         console.warn('countries_stream returned no segments; falling back to full /api/countries');
         try {
-          // request with same simplify value (might be 0.0)
-          fetchCountries(simplify).catch(err => console.warn('fallback fetchCountries failed', err));
+          fetchCountries(0.0).catch(err => console.warn('fallback fetchCountries failed', err));
         } catch (e) {
           console.warn('Fallback fetchCountries invocation failed', e);
         }
@@ -1650,11 +1682,12 @@ async function requestVisibleData(lat = null, lon = null, options = {}) {
 
   // Country outlines streaming with computed simplify
   try {
-    const simplify = computeSimplifyForRadius(radius);
+    // Always request highest detail from server (no simplification)
+    const simplify = 0.0;
     if (shouldFetchCountries(centerLat, centerLon, radius, simplify)) {
       lastCountriesFetch = { lat: centerLat, lon: centerLon, radius, simplify };
-      // Render country outlines all at once (disable segmented/streamed rendering)
-      fetchCountries(simplify).catch(err => console.warn('fetchCountries error', err));
+      // Render country outlines all at once (non-segmented) at highest detail
+      fetchCountries(0.0).catch(err => console.warn('fetchCountries error', err));
     }
   } catch (e) {
     console.warn('requestVisibleData: country stream failed', e);
@@ -1844,13 +1877,14 @@ try {
   const dist = camera.position.distanceTo(controls.target || new THREE.Vector3());
   const radius = cameraDistanceToRadius(dist);
   const simplify = computeSimplifyForRadius(radius);
-  // set lastCountriesFetch so schedule logic can skip redundant requests
-  lastCountriesFetch = { lat: sub.lat, lon: sub.lon, radius, simplify };
-  // Render full country outlines at startup (non-segmented)
-  fetchCountries(simplify);
+    // set lastCountriesFetch so schedule logic can skip redundant requests
+    // note: we request full-detail from the server (simplify=0.0)
+    lastCountriesFetch = { lat: sub.lat, lon: sub.lon, radius, simplify: 0.0 };
+    // Render full country outlines at startup (non-segmented) with highest detail
+    fetchCountries(0.0);
 } catch (e) {
   // fallback to coarse globe request if something goes wrong
-  fetchCountries(1.5);
+    fetchCountries(0.0);
 }
 
 /* TEST ICONS WORK, uncomment this if you want to see test values
