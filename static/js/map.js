@@ -8,7 +8,10 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0b1020);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(window.devicePixelRatio);
+// clamp pixel ratio to avoid huge canvases on hi-dpi devices (Surface Pro etc.)
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+// ensure canvas is displayed as block so it sizes predictably across browsers
+renderer.domElement.style.display = 'block';
 container.appendChild(renderer.domElement);
 
 const camera = new THREE.PerspectiveCamera(45, 2, 0.1, 1000);
@@ -609,9 +612,13 @@ controls.addEventListener('end', scheduleFetchForControls);
 function onWindowResize() {
   const width = container.clientWidth;
   const height = container.clientHeight;
-  camera.aspect = width / height || 2;
+  // avoid division by zero; ensure sensible aspect
+  camera.aspect = (height > 0) ? (width / height) : camera.aspect;
   camera.updateProjectionMatrix();
-  renderer.setSize(width, height, false);
+  // update size and also update the canvas style to match
+  renderer.setSize(width, height, true);
+  renderer.domElement.style.width = width + 'px';
+  renderer.domElement.style.height = height + 'px';
 }
 
 window.addEventListener('resize', onWindowResize, false);
