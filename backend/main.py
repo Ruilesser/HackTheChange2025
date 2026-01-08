@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from typing import List
 
-import requests
 import math
 from functools import lru_cache
 import time
@@ -11,5 +11,10 @@ import json
 import os
 
 app = FastAPI()
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024 
-templates = Jinja2Templates(directory="templates")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
