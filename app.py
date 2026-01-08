@@ -1,8 +1,4 @@
 from flask import Flask, render_template, request, jsonify, Response
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.templating import Jinja2Templates
 
 import requests
 import math
@@ -11,11 +7,8 @@ import time
 import json
 import os
 
-# app = Flask(__name__)
-# app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
-app = FastAPI()
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024 
-templates = Jinja2Templates(directory="templates")
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
 
 # Helpers for spherical math and geometry rep extraction
