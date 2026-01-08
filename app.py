@@ -1,4 +1,5 @@
 from flask import Flask, render_template, request, jsonify, Response
+
 import requests
 import math
 from functools import lru_cache
@@ -7,7 +8,7 @@ import json
 import os
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024 
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
 
 # Helpers for spherical math and geometry rep extraction
@@ -16,11 +17,12 @@ def _latlon_to_unit_vec(lat, lon):
 
     Uses the same convention as client latLonToVector3 (right-handed mapping).
     """
-    phi = math.radians(90.0 - float(lat))
-    theta = math.radians(float(lon) + 180.0)
-    x = -(math.sin(phi) * math.cos(theta))
-    z = math.sin(phi) * math.sin(theta)
-    y = math.cos(phi)
+    lat = math.radians(lat)
+    lon = math.radians(lon)
+
+    x = math.cos(lat) * math.cos(lon)
+    y = math.sin(lat)
+    z = math.cos(lat) * math.sin(lon)
     return (x, y, z)
 
 
